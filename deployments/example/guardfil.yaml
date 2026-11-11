@@ -1,0 +1,10 @@
+{
+  "config_root": "/etc/guardfil",
+  "credentials_root": "/etc/guardfil/credentials.d",
+  "data": { "address": "127.0.0.1:8080" },
+  "management": {
+    "address": "127.0.0.1:9090",
+    "metrics_token_file": "/etc/guardfil/credentials.d/metrics-token"
+  },
+  "state_dir": "/var/lib/guardfil"
+}

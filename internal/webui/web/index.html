@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GuardFil Control</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <section id="login" class="login hidden">
+    <form id="login-form" class="card login-card" aria-labelledby="login-title">
+      <h1 id="login-title">GuardFil</h1>
+      <p class="login-intro">Review agent activity and manage your rules.</p>
+      <p id="token-help" class="muted">Enter the UI token from GuardFil's <code>token_file</code>.</p>
+      <label for="token">Token</label>
+      <input id="token" type="password" autocomplete="current-password" aria-describedby="token-help login-error" required>
+      <button type="submit" class="primary">Log in</button>
+      <p id="login-error" class="error" role="alert"></p>
+    </form>
+  </section>
+
+  <div id="app" class="hidden">
+    <a class="skip-link" href="#main">Skip to controls</a>
+    <header class="top">
+      <div class="brand">GuardFil <span class="muted">control</span></div>
+      <nav class="tabs" role="tablist" aria-label="Control sections">
+        <button id="tab-policy-btn" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-policy">Policy</button>
+        <button id="tab-content-btn" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-content" tabindex="-1">Content</button>
+      </nav>
+      <div id="status" class="status" role="status">Loading policy…</div>
+      <button id="logout" class="ghost">Log out</button>
+    </header>
+    <div id="flash" class="flash hidden" role="status"><span id="flash-text"></span><button id="flash-dismiss" class="ghost small" type="button" aria-label="Dismiss message">Dismiss</button></div>
+
+    <main id="main" tabindex="-1">
+      <div class="page-heading">
+        <h1>Agent controls</h1>
+        <p class="muted">Review approvals, set rules, and follow recent decisions.</p>
+      </div>
+      <p id="connection-error" class="notice error hidden" role="alert">Updates are unavailable. Showing the last loaded state; reconnecting automatically.</p>
+      <section class="card pending-card" aria-labelledby="h-pending">
+        <div class="section-heading"><h2 id="h-pending">Waiting for you</h2><span id="pending-count" class="tag" aria-live="polite">0 pending</span></div>
+        <p id="ask-off" class="muted hidden">"Ask me" is off: calls needing approval are blocked.</p>
+        <p id="pending-empty" class="empty-state">Nothing is waiting. Calls that need your approval will appear here.</p>
+        <ul id="pending" class="pending"></ul>
+        <div id="file-grants-section" class="hidden">
+          <h3>File access for this session</h3>
+          <p class="muted">These approvals cover only the files and read or write access you approved. They expire when the session ends or rules change.</p>
+          <ul id="file-grants" class="versions"></ul>
+        </div>
+      </section>
+
+      <div id="tab-policy" class="tab-pane" role="tabpanel" aria-labelledby="tab-policy-btn">
+        <section class="card" aria-labelledby="h-rules">
+          <h2 id="h-rules">Rules</h2>
+          <p class="muted">Anything no rule allows is blocked. A block always wins.</p>
+          <div class="table-scroll" role="region" aria-label="Policy rules" tabindex="0">
+          <table class="rules">
+            <thead><tr><th>Action</th><th>Principal</th><th>What</th><th>Which</th><th><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody id="rules"></tbody>
+          </table>
+          </div>
+          <form id="add-rule" class="add-rule">
+            <h3 class="form-title">Add a rule</h3>
+            <label class="field" for="r-action"><span>Action</span><select id="r-action" aria-label="Action">
+              <option value="allow">Allow</option>
+              <option value="block">Block</option>
+              <option value="monitor">Monitor</option>
+              <option value="ask">Ask me</option>
+              <option value="filter">Filter (tool results)</option>
+            </select></label>
+            <label class="field" for="r-principal"><span>Principal</span><select id="r-principal" aria-label="Principal"></select></label>
+            <label id="r-principal-new-field" class="field hidden" for="r-principal-new"><span>New agent name</span><input id="r-principal-new" placeholder="agent name, e.g. notes-bot" aria-label="New agent name"></label>
+            <label class="field" for="r-target"><span>What</span><select id="r-target" aria-label="What">
+              <option value="shell">Shell commands (all)</option>
+              <option value="command">Shell command (exact)</option>
+              <option value="command-prefix">Shell command prefix</option>
+              <option value="tool">Tool</option>
+              <option value="files">File writes in folder</option>
+              <option value="reads">File reads in folder</option>
+              <option value="website">Website</option>
+            </select></label>
+            <label class="field" for="r-value"><span>Which</span><input id="r-value" placeholder="value" aria-label="Which" aria-describedby="website-help command-help filesystem-help"><span id="website-help" class="field-help hidden">Applies to gateway destinations and Claude WebFetch. HTTPS only; the tool must also be allowed. Matches host and path, ignoring query strings.</span></label>
+            <p id="command-help" class="field-help form-title hidden"></p>
+            <p id="filesystem-help" class="field-help form-title hidden">Applies to workspace access through file tools and shell commands in the GuardFil executor. Blocked reads also hide matching entries from folder listings. Filesystem access requires an Allow, Monitor or Ask me rule.</p>
+            <datalist id="tool-list"></datalist>
+            <fieldset id="r-when" class="when hidden">
+              <legend>Amount condition <span class="muted">(optional)</span></legend>
+              <label class="field" for="r-field"><span>Amount argument</span><input id="r-field" placeholder="quantity * limit_price" aria-label="Amount (argument or a * b)" list="field-list"></label>
+              <datalist id="field-list"></datalist>
+              <label class="field" for="r-op"><span>Comparison</span><select id="r-op" aria-label="Comparison">
+                <option value="&gt;">&gt;</option>
+                <option value="&gt;=">&ge;</option>
+                <option value="&lt;">&lt;</option>
+                <option value="&lt;=">&le;</option>
+                <option value="==">=</option>
+                <option value="!=">&ne;</option>
+              </select></label>
+              <label class="field" for="r-amount"><span>Threshold</span><input id="r-amount" placeholder="1000" inputmode="decimal" aria-label="Amount" size="8"></label>
+            </fieldset>
+            <div class="form-actions"><button type="submit" class="primary">Add rule</button></div>
+          </form>
+        </section>
+
+        <section class="card" aria-labelledby="h-privacy">
+          <h2 id="h-privacy">Local-only files</h2>
+          <p class="muted">Keep selected workspace data off cloud providers. After reading these files, a GuardFil session can continue locally, but cloud requests and external tool calls are blocked. Its outputs must stay in local-only paths.</p>
+          <form id="privacy-form">
+            <label class="field" for="local-only-paths"><span>Paths for all agents</span>
+              <textarea id="local-only-paths" rows="3" spellcheck="false" placeholder="/workspace/private/**" aria-describedby="privacy-help"></textarea>
+            </label>
+            <p id="privacy-help" class="field-help">One path per line. Use /** to include a folder and its contents. File permission rules still apply. Changing this list or opening a new overlapping workspace can also keep already-reading sessions local.</p>
+            <div class="row"><button type="submit" class="primary">Save local-only paths</button><button id="privacy-discard" type="button" class="ghost">Discard edits</button></div>
+          </form>
+          <div id="private-sessions-section" class="hidden">
+            <h3>Sessions kept local</h3>
+            <p class="muted">Cloud access stays blocked until these sessions end, even if you change the paths or clear file approvals.</p>
+            <ul id="private-sessions" class="versions"></ul>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="h-decisions">
+          <h2 id="h-decisions">Recent decisions</h2>
+          <div class="table-scroll" role="region" aria-label="Recent decisions" tabindex="0">
+          <table class="decisions">
+            <thead><tr><th>Time</th><th>Principal</th><th>Result</th><th>Call</th><th>Rule / reason</th></tr></thead>
+            <tbody id="decisions"></tbody>
+          </table>
+          </div>
+          <p id="decisions-empty" class="empty-state">No decisions yet. Agent calls will appear here as they are evaluated.</p>
+        </section>
+
+        <section class="card" aria-labelledby="h-history">
+          <h2 id="h-history">Policy history</h2>
+          <ul id="versions" class="versions"></ul>
+        </section>
+
+        <details class="card">
+          <summary>Advanced: edit the policy YAML</summary>
+          <textarea id="yaml" spellcheck="false" aria-label="Policy YAML"></textarea>
+          <div class="row">
+            <label class="field" for="yaml-note"><span>Change note (optional)</span><input id="yaml-note" placeholder="What changed (optional)" aria-label="Change note"></label>
+            <button id="yaml-save" class="primary">Save YAML</button>
+            <button id="yaml-reload" class="ghost">Discard edits</button>
+          </div>
+        </details>
+      </div>
+
+      <div id="tab-content" class="tab-pane hidden" role="tabpanel" aria-labelledby="tab-content-btn">
+        <section class="card" aria-labelledby="h-injection">
+          <h2 id="h-injection">Prompt-injection scanning</h2>
+          <p class="muted">Scans tool results and API responses for prompt injections aimed at the model.</p>
+          <form id="injection-form" class="inline-form">
+            <label class="field" for="inj-action"><span>Action</span>
+            <select id="inj-action">
+              <option value="filter">Filter</option>
+              <option value="block">Block</option>
+              <option value="monitor">Monitor</option>
+              <option value="ask">Ask me</option>
+              <option value="none">None (off)</option>
+            </select>
+            </label><label class="field grow" for="inj-tools"><span>Tools</span>
+            <input id="inj-tools" value="*" placeholder="*" aria-describedby="inj-tools-help"></label>
+            <button type="submit" class="primary">Update injection rule</button>
+          </form>
+          <p id="inj-tools-help" class="field-help">Use * for all tools, or comma-separated names such as stockapp.*.</p>
+        </section>
+
+        <section class="card" aria-labelledby="h-content-lists">
+          <h2 id="h-content-lists">Content rules</h2>
+          <p class="muted">Filter, block, monitor or ask for words and patterns in requests and responses.</p>
+          <div class="table-scroll" role="region" aria-label="Content rules" tabindex="0">
+          <table class="rules">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Action</th>
+                <th>Direction</th>
+                <th>Tools</th>
+                <th>Words / Patterns</th>
+                <th><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody id="content-lists"></tbody>
+          </table>
+          </div>
+          <p id="content-lists-empty" class="empty-state">No content lists configured. Add words or patterns below to create your first list.</p>
+          <form id="add-content-list" class="content-form">
+            <h3 id="content-form-title" class="form-title">Add word or pattern list</h3>
+            <div class="form-grid">
+              <label class="field" for="cl-name"><span>List name</span><input id="cl-name" placeholder="List name, e.g. Internal codenames" required></label>
+              <label class="field" for="cl-id"><span>List ID</span><input id="cl-id" placeholder="id, e.g. codenames" required pattern="[a-z0-9\-]{1,48}"></label>
+              <label class="field" for="cl-action"><span>Action</span><select id="cl-action">
+                <option value="filter">Filter</option>
+                <option value="block">Block</option>
+                <option value="monitor">Monitor</option>
+                <option value="ask">Ask me</option>
+              </select></label>
+              <label class="field" for="cl-direction"><span>Direction</span><select id="cl-direction">
+                <option value="both">Both (in &amp; out)</option>
+                <option value="request">Request (outbound)</option>
+                <option value="response">Response (inbound)</option>
+              </select></label>
+              <label class="field" for="cl-tools"><span>Tools</span><input id="cl-tools" placeholder="tools, e.g. * or stockapp.*" value="*"></label>
+            </div>
+            <div class="form-grid mt-8">
+              <label class="field" for="cl-words"><span>Words (comma-separated)</span><input id="cl-words" class="flex-1" placeholder="Words (comma-separated), e.g. Project Falcon, Bluebird"></label>
+              <label class="field" for="cl-patterns"><span>Patterns (comma-separated)</span><input id="cl-patterns" class="flex-1" placeholder="Regex patterns (comma-separated), e.g. EXT-[0-9]+"></label>
+              <label class="check-field"><input type="checkbox" id="cl-case"> Case sensitive</label>
+            </div>
+            <div class="row mt-8">
+              <button type="submit" id="cl-submit" class="primary">Add list</button>
+              <button type="button" id="cl-cancel" class="ghost hidden">Cancel</button>
+            </div>
+          </form>
+        </section>
+
+        <section class="card" aria-labelledby="h-try-content">
+          <h2 id="h-try-content">Try it</h2>
+          <p class="muted">Test how content rules and injection scanning evaluate text.</p>
+          <form id="try-form">
+            <div class="inline-form">
+              <label class="field grow" for="try-tool"><span>Tool</span>
+              <input id="try-tool" value="stockapp.get_quote" placeholder="tool name or *"></label>
+              <label class="field" for="try-dir"><span>Direction</span>
+              <select id="try-dir">
+                <option value="response">Response (inbound)</option>
+                <option value="request">Request (outbound)</option>
+              </select>
+              </label><button type="submit" class="primary">Test</button>
+            </div>
+            <label class="field mt-8" for="try-text"><span>Text to test</span><textarea id="try-text" class="w-full mt-8" placeholder="Enter text to test against content rules..." rows="3"></textarea></label>
+          </form>
+          <div id="try-result" class="try-result hidden" role="status">
+            <div class="row">
+              <strong>Action:</strong> <span id="try-action" class="tag"></span>
+              <span id="try-matches" class="muted"></span>
+            </div>
+            <div class="mt-8">
+              <div class="muted">Rewritten text:</div>
+              <pre id="try-rewritten" class="mono rewritten-box"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="h-content-history">
+          <h2 id="h-content-history">Content rules history</h2>
+          <ul id="content-versions" class="versions"></ul>
+        </section>
+
+        <details class="card">
+          <summary>Advanced: edit content rules JSON</summary>
+          <textarea id="content-json" class="w-full mt-8" spellcheck="false" aria-label="Content rules JSON" rows="10"></textarea>
+          <div class="row mt-8">
+            <label class="field" for="content-json-note"><span>Change note (optional)</span><input id="content-json-note" placeholder="What changed (optional)" aria-label="Change note"></label>
+            <button id="content-json-save" class="primary">Save JSON</button>
+            <button id="content-json-reload" class="ghost">Discard edits</button>
+          </div>
+        </details>
+      </div>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

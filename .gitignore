@@ -1,0 +1,9 @@
+# Local-only outputs (never commit)
+devenv/playground-e2e/node_modules/
+devenv/playground-e2e/*.png
+__pycache__/
+demo/last-run.log
+
+# Red-team runs: keep evidence, never a run's credentials or the agent's home.
+redteam/*/runs/**/credentials/
+redteam/*/runs/**/claude_home/

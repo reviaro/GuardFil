@@ -1,0 +1,13 @@
+schema_version: 1
+tenant_id: synthetic
+revision: 1
+default: deny
+rules:
+  - id: allow-codex-shell
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources:
+        - kind: tool
+          value: codex.exec_command

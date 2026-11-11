@@ -1,0 +1,53 @@
+# GuardFil demo stack. Use demo/run_demo.sh, which creates the owner-only
+# directories and config this file mounts.
+#
+# Two internal networks with no route outside:
+#   apps:   GuardFil and the stock app. Only GuardFil can reach the app.
+#   agents: GuardFil and outside agents. Agents reach only GuardFil's gateway.
+services:
+  guardfil:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    image: guardfil-local:dev
+    user: "${GF_UID:?}:${GF_GID:?}"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    command: ["-config", "/etc/guardfil/guardfil.yaml"]
+    networks: [apps, agents]
+    volumes:
+      - {type: bind, source: "${DEMO_HOME:?}/config", target: /etc/guardfil, read_only: true}
+      - {type: bind, source: "${DEMO_HOME}/credentials", target: /etc/guardfil/credentials.d, read_only: true}
+      - {type: bind, source: "${DEMO_HOME}/state", target: /var/lib/guardfil}
+      - {type: bind, source: "${DEMO_HOME}/run", target: /run/guardfil}
+      - {type: bind, source: "${DEMO_HOME}/owner", target: /run/guardfil-owner}
+  stockapp:
+    image: "${PY_IMAGE:?}"
+    user: "${GF_UID}:${GF_GID}"
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    networks: [apps]
+    environment:
+      HOME: /tmp
+      MODEL: "${MODEL:-openai:gpt-6-luna}"
+      BROKER_SOCK: /run/guardfil-broker/broker.sock
+      GUARDFIL_SOCK: /run/guardfil/approval.sock
+      APP_URL: "127.0.0.1:8000"
+      APP_KEY_FILE: /app/key
+    command: ["python3", "-I", "/demo/stockapp/app.py", "8000", "/app/key", "/app/requests.jsonl"]
+    volumes:
+      - {type: bind, source: ".", target: /demo, read_only: true}
+      - {type: bind, source: "../clients/python", target: /clients, read_only: true}
+      - {type: bind, source: "${DEMO_HOME}/app", target: /app}
+      # The built-in agent asks GuardFil on the approval socket (owner answers elsewhere).
+      - {type: bind, source: "${DEMO_HOME}/run", target: /run/guardfil}
+      - {type: bind, source: "${BROKER_DIR:?}", target: /run/guardfil-broker}
+networks:
+  apps:
+    name: gfdemo-apps
+    internal: true
+  agents:
+    name: gfdemo-agents
+    internal: true

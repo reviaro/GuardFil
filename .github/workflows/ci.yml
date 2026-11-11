@@ -1,0 +1,135 @@
+name: guardfil-ci
+on: [push, pull_request]
+permissions: { contents: read }
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    container:
+      image: golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Trust controlled checkout for VCS metadata
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Verify immutable release inputs
+        run: |
+          set -eu
+          . deployments/release-inputs.env
+          raw_go_version=$(go version)
+          test -n "$raw_go_version"
+          test "$(printf '%s\n' "$raw_go_version" | awk '{print $3}')" = "$GO_VERSION"
+          workspace_commit=$(git -C "$GITHUB_WORKSPACE" rev-parse HEAD)
+          test -n "$workspace_commit"
+          test "$workspace_commit" = "$GITHUB_SHA"
+          ./scripts/check-clean.sh "$GITHUB_WORKSPACE"
+          test "$(go list -m -f '{{.Version}}' go.yaml.in/yaml/v3)" = v3.0.5
+          grep -Fx 'go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=' go.sum
+      - run: ./scripts/check-format.sh
+      - name: Prepare complete module metadata for offline reproducibility
+        run: go list -m -json all > /dev/null
+      - run: go mod verify
+      - run: go vet ./...
+      - name: Focused P11 ProcessShell build test
+        run: go test ./tests/security -run '^TestP11ProcessShellBuilds$' -count=1
+      - run: go test ./...
+      - run: go test -race ./...
+      - name: Fail-closed verification offline regression suite
+        run: ./scripts/test-failclosed-verification.sh
+      - name: API gateway end-to-end (TCP and Unix socket, fake app)
+        run: |
+          set -eu
+          go build -o "$RUNNER_TEMP/guardfil-gw" ./cmd/guardfil
+          bash devenv/gateway-e2e/run.sh "$RUNNER_TEMP/guardfil-gw"
+      - name: Headless CLI, owner approvals, Python client and gateway
+        run: |
+          go build -o "$RUNNER_TEMP/guardfil-approve" ./cmd/guardfil-approve
+          python3 -B devenv/headless-e2e/run.py "$RUNNER_TEMP/guardfil-gw" "$RUNNER_TEMP/guardfil-approve"
+      - name: Reproducibility gate (isolated clean worktrees)
+        run: |
+          set -eu
+          export REPRO_OUTPUT_DIR="$RUNNER_TEMP/guardfil-repro-$GITHUB_RUN_ID"
+          ./scripts/reproducibility.sh
+          test -f "$REPRO_OUTPUT_DIR/reproducibility-manifest.txt"
+          test -f "$REPRO_OUTPUT_DIR/SHA256SUMS"
+          grep -Fx "source_commit=$GITHUB_SHA" "$REPRO_OUTPUT_DIR/reproducibility-manifest.txt"
+          grep -F 'vcs.modified=false' "$REPRO_OUTPUT_DIR/guardfil-a.buildinfo.txt"
+          grep -F 'vcs.modified=false' "$REPRO_OUTPUT_DIR/guardfil-b.buildinfo.txt"
+          grep -F 'fresh GOCACHE directories' "$REPRO_OUTPUT_DIR/reproducibility-manifest.txt"
+          awk 'NR == 1 { first = $1; next } NR == 2 { exit first == $1 ? 0 : 1 } END { if (NR != 2) exit 1 }' "$REPRO_OUTPUT_DIR/SHA256SUMS"
+          # The first output must not have dirtied the checkout before build B.
+          ./scripts/check-clean.sh "$GITHUB_WORKSPACE"
+  escape-suite:
+    # A real executor container (anchor + agent) must hold against every
+    # scripted escape attempt.  Needs Docker on the runner, so no job container.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Executor unit tests
+        run: |
+          python3 -m unittest deployments.local.test_executor deployments.local.test_workspace deployments.local.test_workspace_scope deployments.local.test_run_codex deployments.local.test_claude_hook deployments.local.test_agent_identity
+          python3 -m unittest deployments.local.test_local_config
+          python3 -m unittest redteam.m5.test_redteam redteam.m5.test_run_redteam redteam.m6.test_standin redteam.m6.test_scripted_scorer redteam.m6.test_lab_mcp
+      - name: Pull the pinned executor image
+        run: docker pull golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195
+      - name: Enable filesystem mediation on the disposable runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fuse3
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+          test -r /dev/fuse && test -w /dev/fuse
+      - name: Build runtime binaries and filesystem integration tests
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w -e CGO_ENABLED=0 -e GOTOOLCHAIN=local -e GOFLAGS=-buildvcs=false \
+            golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 \
+            sh -c 'go build -trimpath -o /w/.ci-bin/guardfil-broker ./cmd/guardfil-broker && go build -trimpath -o /w/.ci-bin/guardfil-mcp-proxy ./cmd/guardfil-mcp-proxy && go build -trimpath -o /w/.ci-bin/guardfil-workspace ./cmd/guardfil-workspace && go test -c -o /w/.ci-bin/workspacefs.test ./internal/workspacefs && chown -R '"$(id -u):$(id -g)"' /w/.ci-bin'
+          echo "GUARDFIL_BROKER_BIN=$PWD/.ci-bin/guardfil-broker" >> "$GITHUB_ENV"
+          echo "GUARDFIL_MCP_PROXY_BIN=$PWD/.ci-bin/guardfil-mcp-proxy" >> "$GITHUB_ENV"
+          echo "GUARDFIL_WORKSPACE_BIN=$PWD/.ci-bin/guardfil-workspace" >> "$GITHUB_ENV"
+      - name: Real filesystem policy checks (mounts required)
+        run: GUARDFIL_FUSE_TEST=1 .ci-bin/workspacefs.test -test.v -test.timeout=90s
+      - name: Nested storage and bind-mount policy checks
+        run: sudo env GUARDFIL_FUSE_TEST=1 GUARDFIL_MOUNT_TEST=1 .ci-bin/workspacefs.test -test.v -test.run TestMountedStorageMountsAndBindAliases -test.timeout=90s
+      - name: Escape suite
+        run: python3 -I deployments/local/escape_suite.py --json "$RUNNER_TEMP/escape-suite.json"
+      - name: Build local GuardFil image
+        run: docker build -t guardfil-local:dev -f deployments/Dockerfile .
+      - name: Python agent without UI (scripted model, real executor)
+        run: |
+          set -eu
+          fixture_container=$(docker create guardfil-local:dev)
+          trap 'docker rm -f "$fixture_container" >/dev/null' EXIT
+          docker cp "$fixture_container:/guardfil" "$RUNNER_TEMP/guardfil-python"
+          python3 -B devenv/headless-e2e/python_runtime.py "$RUNNER_TEMP/guardfil-python"
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.318
+      - name: Install pinned native Codex and helpers
+        run: |
+          bash scripts/install-ci-codex.sh "$RUNNER_TEMP/guardfil-codex"
+          echo "CODEX_BIN_DIR=$RUNNER_TEMP/guardfil-codex" >> "$GITHUB_ENV"
+      - name: Scripted red-team and command rules
+        run: |
+          python3 -B devenv/headless-e2e/codex_approvals.py --codex "$CODEX_BIN_DIR/codex"
+          python3 -B redteam/m6/run_scripted_redteam.py --runtime codex --case all --image guardfil-local:dev
+          python3 -B redteam/m6/run_scripted_redteam.py --runtime claude-code --case all --image guardfil-local:dev
+          python3 -B redteam/m6/run_scripted_redteam.py --runtime codex --case commands --image guardfil-local:dev
+          python3 -B redteam/m6/run_scripted_redteam.py --runtime claude-code --case commands --image guardfil-local:dev
+
+  quickstart:
+    # The README quickstart, followed on a clean runner. No API
+    # key: a scripted stand-in model replaces the provider (see the script).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Enable filesystem mediation on the disposable runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y fuse3
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code@2.1.318
+      - name: Follow the README quickstart
+        run: deployments/local/quickstart-check.sh

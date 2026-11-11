@@ -1,0 +1,39 @@
+# Local GuardFil with the approval service (and optionally the web UI).
+# Use deployments/local/guardfil-local.sh rather than running this directly:
+# it creates the owner-only directories and config this file mounts.
+services:
+  guardfil:
+    build:
+      context: ../..
+      dockerfile: deployments/Dockerfile
+    image: guardfil-local:dev
+    # GuardFil accepts only loopback listeners. Host networking makes the UI's
+    # 127.0.0.1 the host's loopback; nothing is published beyond it.
+    network_mode: host
+    # Run as the invoking user so the host-side agent harness can use the
+    # owner-only approval socket, and the owner-only dirs pass GuardFil's checks.
+    user: "${GF_UID:?run via guardfil-local.sh}:${GF_GID:?run via guardfil-local.sh}"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    command: ["-config", "/etc/guardfil/guardfil.yaml"]
+    volumes:
+      - type: bind
+        source: ${GF_HOME:?run via guardfil-local.sh}/config
+        target: /etc/guardfil
+        read_only: true
+      - type: bind
+        source: ${GF_HOME}/credentials
+        target: /etc/guardfil/credentials.d
+        read_only: true
+      - type: bind
+        source: ${GF_HOME}/state
+        target: /var/lib/guardfil
+      - type: bind
+        source: ${GF_HOME}/run
+        target: /run/guardfil
+      - type: bind
+        source: ${GF_HOME}/owner
+        target: /run/guardfil-owner
+    restart: "no"

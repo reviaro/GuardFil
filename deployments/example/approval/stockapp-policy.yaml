@@ -1,0 +1,65 @@
+# Example policy for the stock app's agent: read freely, place orders worth up
+# to 1,000 (quantity x limit price) and record them, filter secrets out of the
+# portfolio, ask the owner above that or
+# when an order has no limit price, record cancels, never move money out.
+schema_version: 1
+tenant_id: synthetic
+revision: 1
+default: deny
+rules:
+  - id: allow-quotes
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.get_quote}]
+  # M4: news and support messages are allowed; content rules (content-rules.json)
+  # scan what they carry: injections in news, listed words in messages.
+  - id: allow-news
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.get_news}]
+  - id: monitor-messages
+    effect: monitor
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.send_message}]
+  # The portfolio comes back with secrets (if any) removed before the agent
+  # sees it. Only callers that filter results (the gateway, the Python client's
+  # guard) can make this call; others are blocked.
+  - id: filter-portfolio
+    effect: sanitize
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.get_portfolio}]
+  - id: monitor-cancels
+    effect: monitor
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.cancel_order}]
+  - id: monitor-orders
+    effect: monitor
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.place_order}]
+  # An order without limit_price has no known value, so this rule holds it too.
+  - id: ask-big-orders
+    effect: require_approval
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.place_order}]
+      decimal:
+        - {field: quantity*limit_price, operator: ">", value: "1000"}
+  - id: block-withdrawals
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: stockapp.withdraw_funds}]

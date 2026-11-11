@@ -1,0 +1,5 @@
+schema_version: 1
+tenant_id: synthetic
+revision: 1
+default: deny
+rules: []

@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "lists": [
+    {
+      "id": "codenames",
+      "name": "Internal Project Codenames",
+      "action": "filter",
+      "direction": "both",
+      "tools": [
+        "*"
+      ],
+      "words": [
+        "Project Falcon",
+        "Bluebird"
+      ]
+    },
+    {
+      "id": "ext-accounts",
+      "name": "External Account Numbers",
+      "action": "block",
+      "direction": "request",
+      "tools": [
+        "stockapp.*"
+      ],
+      "patterns": [
+        "EXT-[0-9]+"
+      ]
+    },
+    {
+      "id": "watch-acme",
+      "name": "Watch ACME Holdings",
+      "action": "monitor",
+      "direction": "both",
+      "tools": [
+        "stockapp.*"
+      ],
+      "words": [
+        "ACME"
+      ]
+    }
+  ],
+  "injection": {
+    "action": "filter",
+    "tools": [
+      "*"
+    ]
+  }
+}

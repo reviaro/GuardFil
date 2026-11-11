@@ -1,0 +1,28 @@
+services:
+  guardfil:
+    build:
+      context: ../..
+      dockerfile: deployments/Dockerfile
+      args:
+        # Supply a reviewed image reference ending in @sha256:<digest>; never a floating tag.
+        GO_BUILDER_IMAGE: ${GO_BUILDER_IMAGE:?set_to_reviewed_go_1.27.1_digest}
+    read_only: true
+    user: "65532:65532"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: ["ALL"]
+    volumes:
+      - type: bind
+        source: ./guardfil.yaml
+        target: /etc/guardfil/guardfil.yaml
+        read_only: true
+      - type: bind
+        source: ./credentials.d
+        target: /etc/guardfil/credentials.d
+        read_only: true
+      - type: volume
+        source: guardfil-state
+        target: /var/lib/guardfil
+    # Do not publish either loopback listener as a secure remote deployment mechanism.
+volumes:
+  guardfil-state: {}

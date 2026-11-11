@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GuardFil Advisory Playground</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="banner">SYNTHETIC / ADVISORY ONLY - nothing is executed, dispatch_eligible is always false</div>
+    <div class="header-title">
+      <h1>GuardFil Playground</h1>
+      <span class="subtitle">Advisory Kernel Prototype</span>
+    </div>
+    <nav class="nav-tabs" role="tablist">
+      <button id="tab-evaluate-btn" class="tab-button active" role="tab" aria-selected="true" aria-controls="tab-evaluate">Evaluate</button>
+      <button id="tab-policy-btn" class="tab-button" role="tab" aria-selected="false" aria-controls="tab-policy">Policy</button>
+      <button id="tab-fixtures-btn" class="tab-button" role="tab" aria-selected="false" aria-controls="tab-fixtures">Red-team fixtures</button>
+      <button id="tab-history-btn" class="tab-button" role="tab" aria-selected="false" aria-controls="tab-history">History</button>
+    </nav>
+  </header>
+
+  <main class="app-main">
+    <div id="error-banner" role="alert" class="alert-error hidden"></div>
+    <section id="tab-evaluate" class="tab-content active" role="tabpanel">
+      <div class="eval-layout">
+        <div class="panel form-panel">
+          <h2>Advisory Evaluation</h2>
+          <div class="presets-section">
+            <span class="section-label">Presets:</span>
+            <div class="preset-buttons">
+              <button id="preset-allow-read" class="btn-preset">Allowed read</button>
+              <button id="preset-deny-delete" class="btn-preset">Denied delete</button>
+              <button id="preset-no-cred" class="btn-preset">No credential</button>
+              <button id="preset-malformed" class="btn-preset">Malformed JSON</button>
+              <button id="preset-unknown-tool" class="btn-preset">Unknown tool</button>
+              <button id="preset-expired-env" class="btn-preset">Expired envelope</button>
+            </div>
+          </div>
+
+          <form id="eval-form" class="eval-form">
+            <div class="form-group">
+              <label for="tool-select">Tool</label>
+              <select id="tool-select" class="form-control"></select>
+            </div>
+            <div id="custom-tool-group" class="form-group hidden">
+              <label for="custom-tool-input">Custom Tool Name</label>
+              <input type="text" id="custom-tool-input" class="form-control" placeholder="e.g. fake.unknown_tool or fake.Read_note">
+            </div>
+
+            <div class="form-group">
+              <label for="credential-select">Credential</label>
+              <select id="credential-select" class="form-control">
+                <option value="valid">valid</option>
+                <option value="expired">expired</option>
+                <option value="unknown">unknown</option>
+                <option value="none">none</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label for="ttl-input">TTL (ms)</label>
+              <input type="number" id="ttl-input" class="form-control" value="30000" min="1" max="60000">
+            </div>
+
+            <div class="form-group form-checks">
+              <label class="checkbox-label">
+                <input type="checkbox" id="cancelled-check">
+                <span>Cancelled context</span>
+              </label>
+              <label class="checkbox-label">
+                <input type="checkbox" id="expired-envelope-check">
+                <span>Expired envelope</span>
+              </label>
+            </div>
+
+            <div class="form-group">
+              <label for="payload-input">Payload (raw JSON)</label>
+              <textarea id="payload-input" class="form-control code-editor" rows="6"></textarea>
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" id="submit-evaluate" class="btn-primary">Evaluate</button>
+            </div>
+          </form>
+        </div>
+
+        <div class="panel result-panel">
+          <h2>Result</h2>
+          <div id="result-container" class="result-container">
+            <div id="result-placeholder" class="placeholder-text">Run an evaluation or select a preset to see advisory decision results.</div>
+            <div id="result-card" class="result-card hidden">
+              <div class="badge-row">
+                <span id="badge-effect" class="badge"></span>
+                <span id="result-summary" class="result-summary-text"></span>
+              </div>
+
+              <div class="trace-section">
+                <h3>Pipeline Trace</h3>
+                <div id="trace-steps" class="trace-steps"></div>
+              </div>
+
+              <div class="details-section">
+                <h3>Decision Details</h3>
+                <table class="key-value-table">
+                  <tbody id="decision-fields"></tbody>
+                </table>
+              </div>
+
+              <div id="reasons-section" class="reasons-section">
+                <h3>Reasons</h3>
+                <ul id="reasons-list" class="reasons-list"></ul>
+              </div>
+
+              <div id="envelope-section" class="envelope-section">
+                <h3>Error Envelope (guardfil.error/1)</h3>
+                <pre id="envelope-pre" class="code-block"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-policy" class="tab-content" role="tabpanel">
+      <div class="panel">
+        <h2>Policy Document</h2>
+        <div class="policy-meta">
+          <div class="meta-item">
+            <span class="meta-label">Digest:</span>
+            <span id="policy-digest" class="meta-value">-</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Revision:</span>
+            <span id="policy-revision" class="meta-value">-</span>
+          </div>
+          <div class="meta-item">
+            <span class="meta-label">Tool Set:</span>
+            <span id="policy-tool-set" class="meta-value">-</span>
+          </div>
+        </div>
+        <div id="policy-error" class="alert-error hidden"></div>
+        <div class="form-group">
+          <label for="policy-source">Policy Source (YAML)</label>
+          <textarea id="policy-source" class="form-control code-editor" rows="16"></textarea>
+        </div>
+        <div class="form-actions">
+          <button id="policy-apply-btn" class="btn-primary">Apply Policy</button>
+          <button id="policy-reset-btn" class="btn-secondary">Reset to Default</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-fixtures" class="tab-content" role="tabpanel">
+      <div class="panel">
+        <div class="fixtures-header">
+          <h2>Red-Team Advisory Fixtures</h2>
+          <button id="run-fixtures-btn" class="btn-primary">Run Fixtures</button>
+        </div>
+        <div id="fixtures-summary" class="fixtures-summary hidden"></div>
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Fixture ID</th>
+                <th>Tool</th>
+                <th>Effect</th>
+                <th>Stage</th>
+                <th>Auth</th>
+                <th>Reason</th>
+                <th class="cell-digest">Action Digest</th>
+                <th>Dispatch Eligible</th>
+              </tr>
+            </thead>
+            <tbody id="fixtures-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-history" class="tab-content" role="tabpanel">
+      <div class="panel">
+        <h2>Evaluation History (Last 50)</h2>
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Evaluated At</th>
+                <th>Tool</th>
+                <th>Credential</th>
+                <th>Effect</th>
+                <th>Code</th>
+              </tr>
+            </thead>
+            <tbody id="history-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel counters-panel">
+        <h2>Shared Kernel Counters</h2>
+        <p class="note">counters persist across policy changes</p>
+        <pre id="counters-pre" class="code-block"></pre>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

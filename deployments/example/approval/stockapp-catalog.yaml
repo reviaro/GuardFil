@@ -1,0 +1,39 @@
+# Tool catalog for a stock app's agent tools (the owner's example; M3).
+# Install: deployments/local/guardfil-local.sh catalog deployments/example/approval/stockapp-catalog.yaml
+catalog_version: 1
+tools:
+  - id: stockapp.get_quote
+    description: Current price of a stock
+    arguments:
+      symbol: {type: string, required: true, max_length: 12}
+  - id: stockapp.get_portfolio
+    description: Holdings and cash
+    arguments: {}
+  - id: stockapp.place_order
+    description: Buy or sell shares
+    arguments:
+      symbol:      {type: string, required: true, max_length: 12}
+      side:        {type: string, required: true, enum: [buy, sell]}
+      # Bounds keep amount rules sound: a negative price would make any order's
+      # value (quantity x limit_price) look small.
+      quantity:    {type: integer, required: true, min: "1", max: "1000000"}
+      limit_price: {type: decimal, min: "0.01", max: "1000000"}
+  - id: stockapp.cancel_order
+    description: Cancel an open order
+    arguments:
+      order_id: {type: string, required: true, max_length: 64}
+  - id: stockapp.withdraw_funds
+    description: Move cash out of the account
+    arguments:
+      amount:      {type: decimal, required: true, min: "0.01"}
+      destination: {type: string, required: true, max_length: 64}
+  # M4: a third-party news feed (results may carry prompt injection) and a
+  # free-text message to the support desk (requests may carry listed words).
+  - id: stockapp.get_news
+    description: Headlines for a stock
+    arguments:
+      symbol: {type: string, required: true, max_length: 12}
+  - id: stockapp.send_message
+    description: Send a message to the support desk
+    arguments:
+      text: {type: string, required: true, max_length: 2000}

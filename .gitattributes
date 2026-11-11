@@ -1,0 +1,5 @@
+*.sh text eol=lf
+# The Python reference implementation (an oracle for the Go broker's tests) and
+# the red-team harness are not the product: leave them out of GitHub's language stats.
+internal/broker/testdata/pyref/** linguist-detectable=false
+redteam/** linguist-detectable=false

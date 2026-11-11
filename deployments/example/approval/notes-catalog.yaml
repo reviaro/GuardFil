@@ -1,0 +1,14 @@
+# Tool catalog for the demo notes MCP server (run-codex --mcp notes=demo).
+catalog_version: 1
+tools:
+  - id: notes.list_notes
+    description: List note names
+  - id: notes.read_note
+    description: Read a note
+    arguments:
+      name: {type: string, required: true, max_length: 64}
+  - id: notes.add_note
+    description: Add a note
+    arguments:
+      name: {type: string, required: true, max_length: 64}
+      text: {type: string, required: true, max_length: 2000}

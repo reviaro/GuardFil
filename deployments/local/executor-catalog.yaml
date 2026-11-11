@@ -1,0 +1,63 @@
+# Tool catalog for agents in the executor (M5, run-agent): Claude Code's built-in
+# tools, and the notes tools of the example Python agent (python_agent_example.py).
+# The managed hook (claude_hook.py) sends each built-in tool as claude.<name, lower-case>
+# with a projection of its input: the path, pattern, URL or query a rule can judge.
+# Bash and the file-writing tools are sent as shell and file_write requests and are not listed.
+# A tool missing here is blocked (TOOL_REVISION_UNKNOWN).  Merge with your app's catalog if any.
+catalog_version: 1
+tools:
+  - id: claude.read
+    description: Read a file
+    arguments:
+      file_path: {type: string, max_length: 1024}
+  - id: claude.glob
+    description: Find files by pattern
+    arguments:
+      pattern: {type: string, max_length: 1024}
+      path:    {type: string, max_length: 1024}
+  - id: claude.grep
+    description: Search file contents
+    arguments:
+      pattern: {type: string, max_length: 1024}
+      path:    {type: string, max_length: 1024}
+  - id: claude.ls
+    description: List a directory
+    arguments:
+      path: {type: string, max_length: 1024}
+  - id: claude.webfetch
+    description: Fetch a web page (the executor has no network)
+    arguments:
+      url: {type: string, max_length: 2048}
+  - id: claude.websearch
+    description: Search the web (a provider-side tool; the broker refuses it)
+    arguments:
+      query: {type: string, max_length: 1024}
+  - id: claude.task
+    description: Start a subagent (its own tool calls are decided too)
+    arguments:
+      description:   {type: string, max_length: 1024}
+      subagent_type: {type: string, max_length: 128}
+  - id: claude.agent
+    description: Start a subagent (its own tool calls are decided too)
+    arguments:
+      description:   {type: string, max_length: 1024}
+      subagent_type: {type: string, max_length: 128}
+  - id: claude.todowrite
+    description: Update the task list
+    arguments: {}
+  - id: claude.toolsearch
+    description: Load deferred tool definitions
+    arguments: {}
+  # The example Python agent's tools (they act only on its workspace).
+  - id: notes.list_notes
+    description: List the notes in the workspace
+    arguments: {}
+  - id: notes.read_note
+    description: Read one note
+    arguments:
+      name: {type: string, required: true, max_length: 64}
+  - id: notes.write_note
+    description: Write one note
+    arguments:
+      name: {type: string, required: true, max_length: 64}
+      text: {type: string, required: true, max_length: 4000}

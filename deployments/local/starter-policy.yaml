@@ -1,0 +1,154 @@
+# Starter policy for a local agent. Anything no rule allows is blocked; a
+# block always wins. Edit it in the web UI, or edit this copy in
+# $GF_HOME/config/policy.yaml and restart.
+schema_version: 1
+tenant_id: synthetic
+revision: 1
+default: deny
+rules:
+  # Filesystem reads through every runtime and shell use this same boundary.
+  # Add narrower deny rules for files the agent must not read.
+  - id: allow-workspace-reads
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.read]
+      resources: [{kind: path, value: /workspace/**}]
+  # Ask me before any shell command.
+  - id: ask-shell
+    effect: require_approval
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources:
+        - kind: tool
+          value: codex.exec_command
+  # Let the agent write in its workspace, but record every write.
+  - id: monitor-workspace-writes
+    effect: monitor
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources:
+        - kind: path
+          value: /workspace/**
+  # Never let it touch its own config.
+  - id: block-workspace-dotfiles
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources:
+        - kind: path
+          value: /workspace/.codex/**
+  # ... nor Claude Code's project settings.
+  - id: block-workspace-claude-settings
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources:
+        - kind: path
+          value: /workspace/.claude/**
+  # Files that your machine runs later, outside the boundary: git hooks,
+  # direnv, editor tasks, in the workspace or any folder below it
+  # (/workspace/**/NAME).  Blocked by default.  To allow one, delete its rule
+  # in the web UI (writes in the workspace are then allowed and recorded); to be
+  # asked instead, delete it and add "Ask me" for File writes on the same path.
+  # Git hooks and config (core.hooksPath, fsmonitor, filters) run on your git commands.
+  - id: block-host-run-git
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.git/**}]
+  - id: block-host-run-githooks
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.githooks/**}]
+  - id: block-host-run-husky
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.husky/**}]
+  - id: block-host-run-pre-commit
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.pre-commit-config.yaml}]
+  # direnv and mise run these when you cd into the workspace.
+  - id: block-host-run-envrc
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.envrc}]
+  - id: block-host-run-mise
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.mise.toml}]
+  - id: block-host-run-mise-plain
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/mise.toml}]
+  # Editors run tasks and settings from these when you open the folder.
+  - id: block-host-run-vscode
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.vscode/**}]
+  - id: block-host-run-idea
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.idea/**}]
+  - id: block-host-run-zed
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.zed/**}]
+  # Dev containers run initializeCommand on your machine.
+  - id: block-host-run-devcontainer
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.devcontainer/**}]
+  # Claude Code (run-agent --runtime claude-code): its read-only tools run
+  # without asking, like the commands Codex reads with.  Install
+  # deployments/local/executor-catalog.yaml so GuardFil knows these tools.
+  - id: allow-claude-read
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: claude.read}]
+  - id: allow-claude-glob
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: claude.glob}]
+  - id: allow-claude-grep
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: claude.grep}]
+  - id: allow-claude-ls
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [tool.invoke]
+      resources: [{kind: tool, value: claude.ls}]

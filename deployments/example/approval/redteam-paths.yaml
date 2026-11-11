@@ -1,0 +1,13 @@
+schema_version: 1
+tenant_id: synthetic
+revision: 1
+default: deny
+rules:
+  - id: allow-notes-writes
+    effect: allow
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources:
+        - kind: path
+          value: /workspace/notes/**
