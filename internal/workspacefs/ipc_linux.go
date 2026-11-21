@@ -23,14 +23,14 @@ func (n *node) Mknod(ctx context.Context, name string, mode uint32, dev uint32, 
 	}
 	defer n.w.unlock()
 	rel := path.Join(n.relative(), name)
-	if err := n.w.check(ctx, false, rel); err != nil {
-		return nil, fs.ToErrno(err)
-	}
-	parent, base, err := n.w.parent(ctx, rel)
+	parent, base, destNames, err := n.w.parent(ctx, rel)
 	if err != nil {
 		return nil, fs.ToErrno(err)
 	}
 	defer unix.Close(parent)
+	if err := n.w.check(ctx, false, destNames...); err != nil {
+		return nil, fs.ToErrno(err)
+	}
 	if err := unix.Mknodat(parent, base, kind|mode&0777, 0); err != nil {
 		return nil, fs.ToErrno(err)
 	}

@@ -89,10 +89,24 @@ func (w *Workspace) lock(ctx context.Context, namespaceWrite bool) error {
 		w.unlock()
 		return err
 	}
+	w.symlinkMu.Lock()
+	w.locked = true
+	w.symlinksCached = false
+	w.cachedSymlinks = nil
+	w.cyclicCached = false
+	w.cachedCyclic = nil
+	w.symlinkMu.Unlock()
 	return nil
 }
 
 func (w *Workspace) unlock() {
+	w.symlinkMu.Lock()
+	w.locked = false
+	w.symlinksCached = false
+	w.cachedSymlinks = nil
+	w.cyclicCached = false
+	w.cachedCyclic = nil
+	w.symlinkMu.Unlock()
 	unix.Flock(w.coordinator, unix.LOCK_UN)
 	w.mu.Unlock()
 }

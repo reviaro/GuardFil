@@ -54,8 +54,10 @@ runtime are in [running agents](guide/running-agents.md).
   and charges that provider's $2 ledger; the container never sees the key.
   See [models and budget](guide/models-and-budget.md).
 - `--workspace` is mounted at `/workspace` through a policy-controlled
-  filesystem, so file rules apply to every read and write, including those
-  made by shell commands or the agent's own code. Rule paths refer to
+  filesystem, including access made by shell commands or the agent's own
+  code. Confirmed gaps in symlink traversal and new bind-alias destinations
+  currently limit this enforcement; use disposable, non-sensitive evaluation
+  workspaces. Rule paths refer to
   `/workspace/...`. See
   [workspace access and command rules](guide/workspace-and-commands.md).
 - Shell commands, file changes and tool calls are decided on
@@ -367,4 +369,4 @@ side effect occurred.
 - The deployment is local and single-user. Remote hosting, SSO and
   multi-tenant operation are out of scope for the alpha.
 - Further limits are in the README's [limits](../README.md#limits) and the
-  [release notes](releases/v0.1.0-alpha.2.md).
+  [release notes](releases/v0.1.0-alpha.3.md).

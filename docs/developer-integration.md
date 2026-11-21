@@ -111,4 +111,4 @@ reach. See [concepts](guide/concepts.md).
 - Builds are checked for reproducibility on Linux `amd64` only. Releases are
   not signed and carry no provenance attestation.
 - See the README's [limits](../README.md#limits) and the
-  [release notes](releases/v0.1.0-alpha.2.md) for the rest.
+  [release notes](releases/v0.1.0-alpha.3.md) for the rest.

@@ -5,7 +5,7 @@ GuardFil provides a unified runner, `deployments/local/guardfil-local.sh run-age
 - **Claude Code**: Anthropic's Claude Code CLI (`claude -p`).
 - **Python**: A standalone Python agent executing custom tools.
 
-All runtimes execute inside the same hardened container executor with a read-only root, dropped capabilities, no external network, and only `/workspace` and a bounded `/tmp` writable.
+All runtimes execute inside the same hardened container executor with a read-only root, dropped capabilities and no external network. Writable locations include the mediated `/workspace`, a bounded `/tmp` and explicit runtime state or socket mounts. Session homes are untrusted output outside workspace policy mediation; see [container hardening](concepts.md#container-hardening).
 
 ## Command Syntax
 

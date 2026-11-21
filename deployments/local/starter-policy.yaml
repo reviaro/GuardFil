@@ -40,7 +40,7 @@ rules:
       operations: [filesystem.write]
       resources:
         - kind: path
-          value: /workspace/.codex/**
+          value: /workspace/**/.codex/**
   # ... nor Claude Code's project settings.
   - id: block-workspace-claude-settings
     effect: deny
@@ -49,7 +49,7 @@ rules:
       operations: [filesystem.write]
       resources:
         - kind: path
-          value: /workspace/.claude/**
+          value: /workspace/**/.claude/**
   # Files that your machine runs later, outside the boundary: git hooks,
   # direnv, editor tasks, in the workspace or any folder below it
   # (/workspace/**/NAME).  Blocked by default.  To allow one, delete its rule
@@ -99,6 +99,31 @@ rules:
       principals: [codex-agent]
       operations: [filesystem.write]
       resources: [{kind: path, value: /workspace/**/mise.toml}]
+  - id: block-host-run-mise-local
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/mise.local.toml}]
+  - id: block-host-run-mise-dot-local
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.mise.local.toml}]
+  # Project config directories also contain local overrides and conf.d fragments.
+  - id: block-host-run-mise-config
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.mise/**}]
+  - id: block-host-run-mise-config-plain
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/mise/**}]
   # Editors run tasks and settings from these when you open the folder.
   - id: block-host-run-vscode
     effect: deny
@@ -125,6 +150,12 @@ rules:
       principals: [codex-agent]
       operations: [filesystem.write]
       resources: [{kind: path, value: /workspace/**/.devcontainer/**}]
+  - id: block-host-run-devcontainer-file
+    effect: deny
+    match:
+      principals: [codex-agent]
+      operations: [filesystem.write]
+      resources: [{kind: path, value: /workspace/**/.devcontainer.json}]
   # Claude Code (run-agent --runtime claude-code): its read-only tools run
   # without asking, like the commands Codex reads with.  Install
   # deployments/local/executor-catalog.yaml so GuardFil knows these tools.

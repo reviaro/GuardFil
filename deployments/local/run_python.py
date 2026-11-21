@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import os
 import secrets
-import shutil
 import signal
 import subprocess
 import sys
@@ -36,6 +35,7 @@ if str(REPO_ROOT) not in sys.path:
 from deployments.local import gfbin  # noqa: E402
 from deployments.local.agent_session import AgentSession, host_path, read_approver_socket  # noqa: E402
 from deployments.local.executor import AgentSpec, Executor, Mount  # noqa: E402
+from deployments.local.runtime_cleanup import cleanup_after_error, finish_cli_cleanup, stop_session  # noqa: E402
 
 IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
 DEFAULT_AGENT = Path(__file__).resolve().parent / "python_agent_example.py"
@@ -53,6 +53,7 @@ class Session:
         self.dir.mkdir(mode=0o700, parents=True)
         self.executor = Executor(self.id, f"guardfil.run-agent={self.id}")
         self.broker: Optional[subprocess.Popen] = None
+        self.broker_log = None
         self.sockdir: Optional[Path] = None
 
     def start(self, agent: Path, model: str, task: str) -> subprocess.Popen:
@@ -87,7 +88,8 @@ class Session:
             if agent.resolve().is_relative_to(self.workspace.resolve()):
                 agent_path = "/workspace/" + agent.resolve().relative_to(self.workspace.resolve()).as_posix()
             else:
-                mounts.append(Mount(agent.resolve(), agent_path))
+                agent_snap = gfbin.runtime_files(self.dir, {"agent.py": agent.resolve()}) / "agent.py"
+                mounts.append(Mount(agent_snap, agent_path))
             env = {"HOME": "/tmp", "BROKER_SOCK": "/run/guardfil-broker/broker.sock",
                    "GUARDFIL_SOCK": "/run/guardfil/approval.sock"}
             gw = gfbin.gateway_socket(self.gf_home)
@@ -99,25 +101,12 @@ class Session:
             spec.workspace_socket = approval_sock
             spec.workspace_binary = gfbin.workspace_bin(self.gf_home)
             return self.executor.start(None, spec)
-        except Exception:
-            self.stop()
+        except Exception as error:
+            cleanup_after_error(error, self.stop)
             raise
 
     def stop(self) -> None:
-        self.executor.stop()
-        if self.agent_session is not None:
-            self.agent_session.close()
-            self.agent_session = None
-        if self.broker is not None:
-            if self.broker.poll() is None:
-                self.broker.send_signal(signal.SIGTERM)
-                try:
-                    self.broker.wait(timeout=180)
-                except subprocess.TimeoutExpired:
-                    self.broker.kill()
-            self.broker_log.close()
-        if self.sockdir is not None:
-            shutil.rmtree(self.sockdir, ignore_errors=True)
+        stop_session(self, broker_timeout=180)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -138,6 +127,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     session = Session(Path(a.gf_home).expanduser(), workspace, a.max_requests, out=lambda s: print(s, flush=True),
                       agent=a.agent)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    status = 1
     try:
         proc = session.start(agent_file, a.model, a.task)
         assert proc.stdout is not None
@@ -145,14 +135,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(raw.decode(errors="replace").rstrip(), flush=True)
         proc.wait()
         print(f"decisions are in {session.gf_home}/state/decisions.jsonl")
-        return proc.returncode
+        status = proc.returncode
     except KeyboardInterrupt:
-        return 130
+        status = 130
     except RuntimeError as e:
         print(f"run-agent: {e}", file=sys.stderr)
-        return 1
+        status = 1
     finally:
-        session.stop()
+        status = finish_cli_cleanup(session, None, status)
+    return status
 
 
 if __name__ == "__main__":

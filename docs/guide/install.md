@@ -36,7 +36,7 @@ By default, GuardFil stores local configuration, sockets, and state under `~/.gu
 | `$GF_HOME/bin/` | Extracted helper binaries (`guardfil-broker`, `guardfil-mcp-proxy`, `guardfil-workspace`) | `0700` |
 
 > [!IMPORTANT]
-> The `$GF_HOME/owner` directory and your API credentials are never mounted into agent containers. Agent containers only receive `$GF_HOME/run/approval.sock` (or their per-agent socket), the gateway socket when a gateway is installed, the filter socket when MCP servers run, and `/workspace`.
+> The `$GF_HOME/owner` directory and provider API credentials are never mounted into agent containers. Runtimes receive the mediated `/workspace`, selected helper binaries and managed settings, session approval and optional gateway/filter sockets, and explicit private runtime state or broker-socket mounts. Writable session homes are untrusted output outside workspace policy mediation; see [container hardening](concepts.md#container-hardening).
 
 ### Model Provider API Keys
 

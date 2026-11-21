@@ -126,6 +126,18 @@ func TestMountedStorageMountsAndBindAliases(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(view, "protected-alias/config"), []byte("bad"), 0600); err == nil {
 		t.Fatal("directory bind alias bypassed write policy")
 	}
+	if err := os.WriteFile(filepath.Join(view, "protected-alias/new-file"), []byte("bad"), 0600); err == nil {
+		t.Fatal("directory bind alias created new file in write-denied directory")
+	}
+	if err := os.Mkdir(filepath.Join(view, "protected-alias/new-dir"), 0700); err == nil {
+		t.Fatal("directory bind alias created new directory in write-denied directory")
+	}
+	if err := os.Symlink("../ok.txt", filepath.Join(view, "protected-alias/new-link")); err == nil {
+		t.Fatal("directory bind alias created new symlink in write-denied directory")
+	}
+	if err := os.Link(filepath.Join(view, "ok.txt"), filepath.Join(view, "protected-alias/new-hardlink")); err == nil {
+		t.Fatal("directory bind alias created new hard link in write-denied directory")
+	}
 	if _, err := os.ReadFile(filepath.Join(view, "secrets-alias/token")); err == nil {
 		t.Fatal("directory bind alias bypassed read policy")
 	}

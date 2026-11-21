@@ -30,10 +30,10 @@ Every executor container enforces strict security parameters:
 - **Read-only Root**: The root filesystem is mounted read-only (`--read-only`).
 - **Dropped Capabilities**: All Linux capabilities are dropped (`--cap-drop=ALL`).
 - **No Privilege Escalation**: New privileges are blocked (`--security-opt no-new-privileges`).
-- **Restricted Storage**: The only writable directories are the mounted project workspace (`/workspace`) and an isolated, size-capped temporary filesystem (`/tmp:rw,nosuid,nodev,size=256m`).
+- **Restricted Storage**: Project access uses the mediated `/workspace`; `/tmp` is an isolated, size-capped temporary filesystem (`/tmp:rw,nosuid,nodev,size=256m`). Runtimes also receive explicit private state or socket mounts. Codex and Claude Code can write their session homes; Python reaches its broker through a writable socket directory. These raw session directories are outside workspace policy mediation and must be treated as untrusted output.
 - **Resource Limits**: Hard caps on process IDs (`--pids-limit 256`), memory (`--memory 2g`), swap (`--memory-swap 2g`), and CPU cores (`--cpus 2`).
 - **Isolated IPC**: Uses private IPC namespaces (`--ipc private`).
-- **No Credentials**: No host environment variables, tokens, cloud credentials, or GuardFil configuration directories are mounted inside the containers.
+- **Provider Credential Separation**: Provider API keys and the owner socket stay on the host. Launchers supply selected runtime settings, read-only managed configuration and session-scoped tool credentials where required; they do not mount the host's credential directories.
 
 ## How a Tool Call Flows
 
@@ -63,5 +63,6 @@ GuardFil provides robust container lockdown and deterministic policy gates, but 
 - **Data already read**: ordinary readable files can reach the model provider. Configure [local-only paths](workspace-and-commands.md#local-only-data) to stop a session's cloud and external tool calls after access and keep its workspace outputs private. Data already sent cannot be recalled.
 - **Single Machine, Single User**: GuardFil is designed for local workstations. It does not provide multi-tenant isolation, enterprise Single Sign-On (SSO), or mutual TLS across networks.
 - **Filesystem compatibility**: the Linux FUSE view supports concurrent sessions, contained hard links and storage mounts. Escaping links, kernel API mounts, device nodes and other FUSE sources remain blocked. File approvals can be retained for the session. See [filesystem behavior](workspace-and-commands.md#filesystem-behavior) for limits, including IPC revocation and unmeasured scan costs.
+- **Filesystem alias limits**: checks cover hard links, visible bind aliases and non-cyclic in-workspace symlinks, including new destinations, cycle refusal and leading-only `..` checks on relative symlinks. Launchers isolate required binaries into per-session snapshots and extra raw mounts check hard links and `/proc/self/mountinfo` aliases, though other shared storage is not detected. See [the current limitations](workspace-and-commands.md#filesystem-alias-limits); use disposable, non-sensitive evaluation data.
 - **Host applications**: controls apply inside the executor. Review agent changes before running builds or scripts directly on the host. The starter policy blocks writes to common host-run settings through the mediated workspace, including from shell commands.
-- **Crash durability**: the Go ledger's failed-write and failed-fsync cases are not yet tested.
+- **Crash durability**: deterministic ledger tests cover failed writes, syncs, closes and renames, including reopening after faults. Power-loss behavior and storage hardware durability are not established by these tests.

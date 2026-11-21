@@ -41,6 +41,7 @@ if str(REPO_ROOT) not in sys.path:
 from deployments.local import gfbin  # noqa: E402
 from deployments.local.agent_session import AgentSession, host_path, read_approver_socket  # noqa: E402
 from deployments.local.executor import AgentSpec, Executor, Mount, RelaySpec  # noqa: E402
+from deployments.local.runtime_cleanup import cleanup_after_error, finish_cli_cleanup, stop_session  # noqa: E402
 from deployments.local.run_codex import parse_mcp  # noqa: E402
 
 IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
@@ -135,13 +136,18 @@ class Session:
         self.label = f"guardfil.run-agent={self.id}"
         self.executor = Executor(self.id, self.label)
         self.broker: Optional[subprocess.Popen] = None
+        self.broker_log = None
         self.sockdir: Optional[Path] = None
 
     def build_agent_spec(self, prompt: str, max_turns: int, home: Path, settings: Path,
                          approval_sock: Path) -> AgentSpec:
         helpers = gfbin.runtime_files(self.dir, {
             name: Path(__file__).resolve().parent / name for name in ("claude_hook.py", "demo_mcp.py")})
-        mounts = [Mount(self.claude_bin, "/usr/local/bin/claude"), Mount(home, "/claude_home", writable=True),
+        if not self.claude_bin.is_file():
+            raise RuntimeError(f"no Claude Code binary at {self.claude_bin}")
+        runtime_bin = gfbin.session_runtime_executables(self, {"claude": self.claude_bin})
+        claude_src = runtime_bin / "claude"
+        mounts = [Mount(claude_src, "/usr/local/bin/claude"), Mount(home, "/claude_home", writable=True),
                   Mount(settings, MANAGED_IN_CONTAINER), Mount(helpers, HERE_IN_CONTAINER),
                   Mount(approval_sock, APPROVAL_IN_CONTAINER, writable=True)]
         if self.mcp:
@@ -222,27 +228,12 @@ class Session:
             spec.workspace_socket = approval_sock
             spec.workspace_binary = gfbin.workspace_bin(self.gf_home)
             return self.executor.start(relay, spec)
-        except Exception:
-            self.stop()
+        except Exception as error:
+            cleanup_after_error(error, self.stop)
             raise
 
     def stop(self) -> None:
-        self.executor.stop()
-        if self.agent_session is not None:
-            self.agent_session.close()
-            self.agent_session = None
-        if self.broker is not None:
-            if self.broker.poll() is None:
-                self.broker.send_signal(signal.SIGTERM)
-                try:
-                    self.broker.wait(timeout=180)
-                except subprocess.TimeoutExpired:
-                    self.broker.kill()
-            for line in (self.broker.stdout.read() if self.broker.stdout else "").splitlines()[-1:]:
-                self.out("broker: " + line[:300])
-            self.broker_log.close()
-        if self.sockdir is not None:
-            shutil.rmtree(self.sockdir, ignore_errors=True)
+        stop_session(self, broker_timeout=180, report_broker=True)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -290,6 +281,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                        agent=getattr(a, "agent", None), mcp=a.mcp, model=a.model)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     transcript = open(a.transcript, "w") if a.transcript else None
+    status = 1
     try:
         proc = session.start(a.prompt, a.max_turns)
         assert proc.stdout is not None
@@ -304,17 +296,16 @@ def main(argv: Optional[List[str]] = None) -> int:
                 print(line, flush=True)
         proc.wait()
         print(f"decisions are in {session.gf_home}/state/decisions.jsonl; broker log in {session.dir}/broker.jsonl")
-        return 0 if proc.returncode == 0 else 1
+        status = 0 if proc.returncode == 0 else 1
     except KeyboardInterrupt:
         print("\nstopped")
-        return 130
+        status = 130
     except RuntimeError as e:
         print(f"run-agent: {e}", file=sys.stderr)
-        return 1
+        status = 1
     finally:
-        if transcript:
-            transcript.close()
-        session.stop()
+        status = finish_cli_cleanup(session, transcript, status)
+    return status
 
 
 if __name__ == "__main__":

@@ -210,6 +210,7 @@ class SessionTest(unittest.TestCase):
                     rc.Session(base, base, 4, base, out=lambda m: None, gateway_socket=Path(bad))
 
             # Omitted gateway_socket leaves mounts and env unchanged
+            (base / "codex").write_bytes(b"#!/bin/sh\n")
             s_none = rc.Session(base, base, 4, base, out=lambda m: None)
             spec_none = s_none.build_agent_spec(base / "ch", base / "cfg.toml")
             self.assertNotIn("GUARDFIL_GATEWAY_SOCKET", spec_none.env)
@@ -246,6 +247,7 @@ class SessionTest(unittest.TestCase):
         # run-agent mounts it without --gateway-socket and passes the agent token.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
+            (home / "codex").write_bytes(b"#!/bin/sh\n")
             (home / "run").mkdir()
             (home / "credentials").mkdir()
             (home / "config").mkdir()
@@ -282,6 +284,42 @@ class SessionTest(unittest.TestCase):
         self.assertEqual(len(seen), 2)
         self.assertEqual(seen[0]["method"], "item/completed")
         self.assertEqual(seen[1]["method"], "turn/completed")
+
+    def test_codex_runtime_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            ws = base / "ws"
+            ws.mkdir()
+            gf_home = base / "gf_home"
+            gf_home.mkdir()
+            bin_dir = base / "bin"
+            bin_dir.mkdir()
+
+            # Missing codex is refused (never mounts an empty runtime_bin)
+            s_missing = rc.Session(ws, gf_home, 4, bin_dir, out=lambda m: None)
+            with self.assertRaisesRegex(RuntimeError, "required codex binary not found"):
+                s_missing.build_agent_spec(base / "ch", base / "cfg.toml")
+
+            # Populated bin_dir with allowlisted binaries and extra neighbor
+            (bin_dir / "codex").write_bytes(b"codex-bin")
+            (bin_dir / "codex-code-mode-host").write_bytes(b"host-bin")
+            (bin_dir / "codex-exec-server").write_bytes(b"exec-bin")
+            (bin_dir / "unrelated-neighbor").write_bytes(b"extra")
+
+            s_ok = rc.Session(ws, gf_home, 4, bin_dir, out=lambda m: None)
+            spec = s_ok.build_agent_spec(base / "ch", base / "cfg.toml")
+            runtime_bin = next(m.source for m in spec.mounts if m.target == "/usr/local/bin")
+            self.assertEqual(
+                sorted(p.name for p in runtime_bin.iterdir()),
+                ["codex", "codex-code-mode-host", "codex-exec-server"],
+            )
+
+            # Symlink in allowlist -> refused
+            (bin_dir / "codex-exec-server").unlink()
+            (bin_dir / "codex-exec-server").symlink_to(bin_dir / "codex")
+            s_sym = rc.Session(ws, gf_home, 4, bin_dir, out=lambda m: None)
+            with self.assertRaisesRegex(RuntimeError, "regular file"):
+                s_sym.build_agent_spec(base / "ch", base / "cfg.toml")
 
 
 if __name__ == "__main__":

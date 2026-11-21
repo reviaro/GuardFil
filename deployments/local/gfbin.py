@@ -29,6 +29,138 @@ def runtime_files(session_dir: Path, files: dict[str, Path]) -> Path:
     return root
 
 
+def runtime_executables(session_dir: Path, executables: dict[str, Path]) -> Path:
+    """Snapshot only the trusted runtime executables into a fresh private per-session directory.
+
+    Streams bytes into new inodes (st_nlink == 1) via O_EXCL temp files so pre-existing hard
+    links or neighbor files in the original binary directory are never exposed inside the container.
+    """
+    import os
+    import shutil
+    import stat
+
+    root = session_dir / "runtime_bin"
+    try:
+        os.lstat(root)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError(f"refusing pre-existing runtime_bin: {root}")
+    os.mkdir(root, 0o700)
+    os.chmod(root, 0o700)
+
+    for idx, (name, source) in enumerate(executables.items()):
+        rel = Path(name)
+        if not name or rel.is_absolute() or ".." in rel.parts:
+            raise RuntimeError(f"invalid runtime executable name: {name!r}")
+        src = Path(source)
+        # Open first and inspect the descriptor, so the file that was checked
+        # is the file that is copied. O_NONBLOCK keeps a FIFO from blocking.
+        try:
+            src_fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError as error:
+            raise RuntimeError(f"runtime executable must be a regular file: {src} ({error.strerror})") from error
+        if not stat.S_ISREG(os.fstat(src_fd).st_mode):
+            os.close(src_fd)
+            raise RuntimeError(f"runtime executable must be a regular file: {src}")
+        target = root / name
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp_path = root / f".tmp-{os.getpid()}-{idx}-{target.name}"
+        try:
+            fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except BaseException:
+            os.close(src_fd)
+            raise
+        try:
+            with os.fdopen(fd, "wb") as dst, os.fdopen(src_fd, "rb") as src_f:
+                shutil.copyfileobj(src_f, dst, length=1024 * 1024)
+                dst.flush()
+                os.fchmod(dst.fileno(), 0o755)
+        except BaseException:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+        os.replace(tmp_path, target)
+    return root
+
+
+RUNTIME_LOCK = "runtime_bin.lock"
+
+
+def hold_runtime_lock(session_dir: Path):
+    """Mark this session's executable snapshot as in use for the launcher's lifetime.
+
+    The kernel drops the lock when the launcher exits, however it exits, so a
+    later launcher can tell an abandoned snapshot from one still starting.
+    """
+    import fcntl
+
+    lock = open(Path(session_dir) / RUNTIME_LOCK, "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        lock.close()
+        raise RuntimeError(f"session directory {session_dir} is in use by another launcher") from error
+    return lock
+
+
+def _session_containers(session_id: str) -> list[str]:
+    import subprocess
+
+    listed = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=guardfil.run-agent={session_id}"],
+                            check=True, capture_output=True, text=True, timeout=30)
+    return listed.stdout.split()
+
+
+def sweep_stale_runtime(sessions_dir: Path, current: Path, containers=_session_containers) -> list[Path]:
+    """Delete executable snapshots left behind by launchers that were killed.
+
+    A snapshot goes only when its launcher no longer holds the session lock
+    and no container of that session exists (a killed launcher's container can
+    still be using the mount). Anything uncertain is kept; this never fails a launch.
+    """
+    import fcntl
+    import shutil
+    import stat
+
+    removed: list[Path] = []
+    try:
+        candidates = sorted(Path(sessions_dir).iterdir())
+    except OSError:
+        return removed
+    for session in candidates:
+        snapshot = session / "runtime_bin"
+        try:
+            if session == current or not stat.S_ISDIR(os.lstat(session).st_mode) \
+                    or not stat.S_ISDIR(os.lstat(snapshot).st_mode):
+                continue
+            fd = os.open(session / RUNTIME_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if containers(session.name):
+                continue
+            shutil.rmtree(snapshot)
+            removed.append(snapshot)
+        except Exception:
+            continue  # Locked, Docker unreachable or removal failed: keep it.
+        finally:
+            os.close(fd)
+    return removed
+
+
+def session_runtime_executables(session, executables: dict[str, Path]) -> Path:
+    """Snapshot a launcher session's executables, clearing abandoned snapshots first."""
+    if getattr(session, "runtime_lock", None) is None:
+        session.runtime_lock = hold_runtime_lock(session.dir)
+    for snapshot in sweep_stale_runtime(session.dir.parent, session.dir):
+        session.out(f"removed abandoned runtime snapshot {snapshot}")
+    return runtime_executables(session.dir, executables)
+
+
 def broker_bin(gf_home: Path) -> Path:
     p = Path(os.environ.get("GUARDFIL_BROKER_BIN") or (Path(gf_home) / "bin" / "guardfil-broker"))
     if not p.is_file() or not os.access(p, os.X_OK):

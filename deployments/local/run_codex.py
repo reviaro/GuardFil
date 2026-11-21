@@ -11,8 +11,9 @@ What it starts (all torn down on exit):
   model requests into frames on the broker's Unix socket,
 - native Codex (`codex app-server`) in the anchor's network namespace: no
   network except the relay on 127.0.0.1, no credentials, read-only root, all
-  capabilities dropped, process, memory and CPU limits, only the workspace
-  writable (see executor.py; `run-agent --runtime codex` is the same thing).
+  capabilities dropped, process, memory and CPU limits. The mediated workspace,
+  bounded /tmp and explicit session home are writable (see executor.py;
+  `run-agent --runtime codex` is the same thing).
 
 Every shell command and file change that Codex asks approval for is decided
 by the running local GuardFil approval service
@@ -22,9 +23,10 @@ externalSandbox policy: the container is the sandbox and GuardFil the gate.
 MCP tools/call requests are checked at the proxy itself, including calls
 Codex does not ask about; results use the same session's filter.
 
-Known limits: Codex's "untrusted" approval policy runs a short list of known
-read-only commands (ls, cat, ...) without asking; they can only read the
-workspace.  The broker caps each model reply at 1024 output tokens.
+Known limits: read-only operations can run without a native approval callback.
+Project files in /workspace
+remain subject to filesystem policy, with the alias limits described in
+the workspace guide. The broker caps each model reply at 1024 output tokens.
 """
 from __future__ import annotations
 
@@ -52,6 +54,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from deployments.local.agent_session import AgentSession, host_path, read_approver_socket  # noqa: E402
 from deployments.local.executor import AgentSpec, Executor, Mount, RelaySpec  # noqa: E402
+from deployments.local.runtime_cleanup import cleanup_after_error, finish_cli_cleanup, stop_session  # noqa: E402
 IMAGE_PIN = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
 # Codex's standalone release folder (holds the codex binary); CODEX_BIN_DIR overrides.
 CODEX_BIN_DIR = os.environ.get("CODEX_BIN_DIR") or str(
@@ -406,8 +409,26 @@ class Session:
         self.sockdir: Optional[Path] = None
         self.executor = Executor(self.id, self.label)
 
+    CODEX_RUNTIME_ALLOWLIST = ("codex", "codex-code-mode-host", "codex-exec-server")
+
     def build_agent_spec(self, codex_home: Path, cfg: Path) -> AgentSpec:
-        mounts = [Mount(self.bin_dir, "/usr/local/bin"), Mount(codex_home, "/codex_home", writable=True),
+        import stat
+
+        bin_dir = self.bin_dir.resolve()
+        executables: dict[str, Path] = {}
+        for name in self.CODEX_RUNTIME_ALLOWLIST:
+            candidate = bin_dir / name
+            try:
+                st = candidate.lstat()
+            except FileNotFoundError:
+                if name == "codex":
+                    raise RuntimeError(f"required codex binary not found: {candidate}") from None
+                continue
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+                raise RuntimeError(f"codex runtime entry must be a regular file: {candidate}")
+            executables[name] = candidate
+        runtime_bin = gfbin.session_runtime_executables(self, executables)
+        mounts = [Mount(runtime_bin, "/usr/local/bin"), Mount(codex_home, "/codex_home", writable=True),
                   Mount(cfg, "/codex_home/config.toml")]
         if self.mcp:
             approval_sock = (Path(host_path(self.gf_home, self.agent_session.approval_socket))
@@ -481,26 +502,12 @@ class Session:
             gate = Gate(str(approval_sock), log=self.out, protected_mcp=[name for name, _ in self.mcp])
             callback = on_message if on_message is not None else self.on_message
             return AppServer(app, gate, self.out, on_message=callback)
-        except Exception:
-            self.stop()
+        except Exception as error:
+            cleanup_after_error(error, self.stop)
             raise
 
     def stop(self) -> None:
-        self.executor.stop()
-        if self.agent_session is not None:
-            self.agent_session.close()
-            self.agent_session = None
-        if self.broker is not None:
-            if self.broker.poll() is None:
-                self.broker.terminate()
-                try:
-                    self.broker.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    self.broker.kill()
-            for line in (self.broker.stdout.read() if self.broker.stdout else "").splitlines()[-1:]:
-                self.out("broker: " + line[:300])
-        if self.sockdir is not None:
-            shutil.rmtree(self.sockdir, ignore_errors=True)
+        stop_session(self, broker_timeout=10, report_broker=True)
 
 
 def run_turns(app: AppServer, prompts: Callable[[], Optional[str]], out: Callable[[str], None],
@@ -617,21 +624,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                       broker_cmd=bcmd,
                       agent=getattr(a, "agent", None), model=a.model)
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+    status = 1
     try:
         app = session.start()
         turns = run_turns(app, interactive_prompts(a.prompt, a.once), session.out, a.model)
         print(f"done: {turns} turn(s); decisions are in {session.gf_home}/state/decisions.jsonl")
-        return 0
+        status = 0
     except KeyboardInterrupt:
         print("\nstopped")
-        return 130
+        status = 130
     except (RunError, RuntimeError, TimeoutError, subprocess.CalledProcessError) as exc:
         print(f"run-codex: {exc}", file=sys.stderr)
-        return 1
+        status = 1
     finally:
-        if transcript:
-            transcript.close()
-        session.stop()
+        status = finish_cli_cleanup(session, transcript, status)
+    return status
 
 
 if __name__ == "__main__":

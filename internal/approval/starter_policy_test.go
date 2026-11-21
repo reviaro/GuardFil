@@ -33,13 +33,26 @@ func TestStarterPolicyBlocksHostRunFiles(t *testing.T) {
 		// the same files in nested folders and repositories
 		"/workspace/sub/repo/.git/hooks/post-checkout", "/workspace/app/.envrc", "/workspace/a/b/.vscode/tasks.json",
 		"/workspace/pkg/mise.toml", "/workspace/svc/.devcontainer/devcontainer.json",
+		"/workspace/.devcontainer.json", "/workspace/a/.devcontainer.json",
+		"/workspace/mise.local.toml", "/workspace/a/mise.local.toml", "/workspace/.mise.local.toml",
+		"/workspace/a/.mise.local.toml", "/workspace/.mise/config.toml", "/workspace/a/.mise/config.local.toml",
+		"/workspace/mise/config.toml", "/workspace/a/mise/conf.d/tools.toml",
+		"/workspace/.config/mise/config.toml", "/workspace/a/.config/mise/config.local.toml",
+		"/workspace/.config/mise.toml", "/workspace/a/.config/mise.local.toml",
+		"/workspace/.codex/config.toml", "/workspace/a/.codex/config.toml",
+		"/workspace/.claude/settings.json", "/workspace/a/.claude/settings.json",
 	} {
 		if out := write(p); out.Effect != "BLOCK" || out.Reasons[0] != "POLICY_DENIED" {
 			t.Errorf("%s: %+v", p, out)
 		}
 	}
 	for _, p := range []string{"/workspace/src/main.go", "/workspace/.gitignore", "/workspace/README.md",
-		"/workspace/.github/workflows/ci.yml", "/workspace/app/.envrc.example", "/workspace/docs/git/notes.md"} {
+		"/workspace/.github/workflows/ci.yml", "/workspace/app/.envrc.example", "/workspace/docs/git/notes.md",
+		"/workspace/.devcontainer.json.example", "/workspace/a/.mise.toml.example",
+		// The path language supports literal names, not suffix globs. Owners
+		// protect their .code-workspace files with explicit path rules.
+		"/workspace/review.code-workspace", "/workspace/a/review.code-workspace",
+		"/workspace/Makefile", "/workspace/package.json", "/workspace/.npmrc"} {
 		if out := write(p); out.Effect != "ALLOW" {
 			t.Errorf("%s: %+v", p, out)
 		}

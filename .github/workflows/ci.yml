@@ -74,6 +74,8 @@ jobs:
           python3 -m unittest redteam.m5.test_redteam redteam.m5.test_run_redteam redteam.m6.test_standin redteam.m6.test_scripted_scorer redteam.m6.test_lab_mcp
       - name: Pull the pinned executor image
         run: docker pull golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195
+      - name: Raw-mount admission against real bind mounts
+        run: python3 -B deployments/local/test_mount_alias_binds.py --docker
       - name: Enable filesystem mediation on the disposable runner
         run: |
           sudo apt-get update -qq

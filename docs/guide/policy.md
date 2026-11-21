@@ -169,14 +169,36 @@ GuardFil evaluates all matching rules simultaneously. Rule ordering in the YAML 
 | `ask-shell` | Ask me | every shell command (`codex.exec_command`) |
 | `monitor-workspace-writes` | Monitor | file writes under `/workspace/**`: allowed and recorded |
 | `allow-workspace-reads` | Allow | filesystem reads under `/workspace/**`; narrower blocks still win |
-| `block-workspace-dotfiles` | Block | writes to `/workspace/.codex/**` (Codex's own config) |
-| `block-workspace-claude-settings` | Block | writes to `/workspace/.claude/**` (Claude Code's project settings) |
-| `block-host-run-*` (11 rules) | Block | writes to files your machine runs later, in the workspace or any folder below it: `.git/`, `.githooks/`, `.husky/`, `.pre-commit-config.yaml`, `.envrc`, `.mise.toml`, `mise.toml`, `.vscode/`, `.idea/`, `.zed/`, `.devcontainer/` |
+| `block-workspace-dotfiles` | Block | writes to `/workspace/**/.codex/**`, including nested project settings |
+| `block-workspace-claude-settings` | Block | writes to `/workspace/**/.claude/**`, including nested project settings |
+| `block-host-run-*` (16 rules) | Block | writes to conventional host-run paths at any depth: `.git/`, `.githooks/`, `.husky/`, `.pre-commit-config.yaml`, `.envrc`, `.mise.toml`, `mise.toml`, `.mise.local.toml`, `mise.local.toml`, `.mise/`, `mise/`, `.vscode/`, `.idea/`, `.zed/`, `.devcontainer/`, `.devcontainer.json` |
 | `allow-claude-read`, `-glob`, `-grep`, `-ls` | Allow | Claude Code's read-only tools |
 
 Everything else is blocked by `default: deny`.
 
 **Allowing one of the blocked paths.** A block always wins, so adding an allow rule does not help. Delete the `block-host-run-*` rule for that path (Policy tab, or the YAML). Writes there are then allowed and recorded by `monitor-workspace-writes`. To be asked each time instead, delete it and add an Ask me rule for File writes on the same path.
+
+**Updating an existing policy.** Updating the checkout or running `up` does
+not merge new starter rules into `$GF_HOME/config/policy.yaml`. Preserve your
+customizations: add the `block-host-run-devcontainer-file`,
+`block-host-run-mise-local`, `block-host-run-mise-dot-local`,
+`block-host-run-mise-config` and `block-host-run-mise-config-plain` rules from
+the current starter, and update both runtime-settings selectors to the
+any-folder forms above. Save through the policy editor, or edit the installed
+YAML and restart. Named agent principals need corresponding rules; the
+starter targets `codex-agent`.
+
+**Filename coverage has limits.** The `mise/` and `.mise/` rules cover every
+directory with those literal names, including `.config/mise/`; they can also
+block an ordinary source directory named `mise`. Replace them with narrower
+exact paths if needed. The pattern language does not support arbitrary
+filename suffixes: protect an editor workspace file with its exact path,
+such as `/workspace/project.code-workspace`, rather than
+`/workspace/**/*.code-workspace`. Environment-specific mise filenames outside
+the blocked directories, nonstandard hook locations and executable build
+files still require your review. See
+[filesystem alias limits](workspace-and-commands.md#filesystem-alias-limits)
+for storage the alias checks do not detect.
 
 **Read rules and searches.** A deny or ask-me `filesystem.read` rule is checked against the named path for a `Read`. A `Grep`, `Glob` or `LS` is blocked when its named folder could contain a restricted path. A `BASE/**/NAME` read rule counts as covering all of `BASE`, so one rule like "deny reads of `/workspace/**/.env`" intentionally blocks every recursive directory search under `/workspace`. Exact file patterns (such as `/workspace/key.pem`) block searches of parent folders containing the file, but do not block searches of sibling paths or subdirectories outside the exact file. The executor also checks the actual opened filesystem object through its mediated workspace. See [workspace access](workspace-and-commands.md#filesystem-behavior) for alias handling, migration and supported operations.
 

@@ -8,6 +8,12 @@ import socket
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+if __package__:
+    from .runtime_cleanup import cleanup_after_error
+else:
+    # Headless tools also import this module directly from deployments/local.
+    from runtime_cleanup import cleanup_after_error
+
 try:
     import yaml
 except ImportError:
@@ -115,15 +121,22 @@ class AgentSession:
         if not self.session_id:
             return
         sess_id = self.session_id
-        self.session_id = None
+        conn = _UnixHTTPConnection(self.approver_socket, timeout=self.timeout)
         try:
-            conn = _UnixHTTPConnection(self.approver_socket, timeout=self.timeout)
             conn.request("DELETE", f"/sessions/{sess_id}")
             resp = conn.getresponse()
-            resp.read()
-            conn.close()
-        except Exception:
-            pass
+            resp.read(1024)
+            # A lost successful response can make the next DELETE return 404.
+            # Both statuses confirm this owner service has no live session.
+            if resp.status not in (204, 404):
+                raise RuntimeError(f"session {sess_id} revocation failed (HTTP {resp.status}); retry close")
+            self.session_id = None
+            self.gateway_token = None
+            self.approval_socket = None
+        except Exception as error:
+            cleanup_after_error(error, conn.close)
+            raise
+        conn.close()
 
     def broker_env(self) -> Dict[str, str]:
         """Host broker binding; never include this environment in AgentSpec."""
@@ -136,4 +149,7 @@ class AgentSession:
         return self.open()
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        if exc_val is not None:
+            cleanup_after_error(exc_val, self.close)
+        else:
+            self.close()

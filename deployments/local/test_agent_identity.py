@@ -1,19 +1,23 @@
 """Offline tests for per-agent identity and runtime session management."""
 import http.server
+import io
 import json
 import os
 import socket
 import sys
+import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from agent_session import AgentSession, read_approver_socket  # noqa: E402
 import run_codex as rc  # noqa: E402
 import run_claude as rcc  # noqa: E402
 import run_python as rp  # noqa: E402
+from deployments.local.runtime_cleanup import CleanupError, finish_cli_cleanup  # noqa: E402
 
 
 class MockOwnerServer:
@@ -157,6 +161,38 @@ class AgentSessionClientTest(unittest.TestCase):
         self.assertEqual(len(self.mock.deleted), 2)
         self.assertTrue(all(item["default"] for item in self.mock.created))
 
+    def test_failed_delete_retains_identity_for_retry_and_closes_connection(self):
+        for failure in (500, OSError("synthetic transport failure")):
+            with self.subTest(failure=failure):
+                sess = AgentSession(self.owner_sock, None)
+                sess.session_id, sess.gateway_token = "synthetic-session", "synthetic-token"
+                first, second = Mock(), Mock()
+                if isinstance(failure, int):
+                    first.getresponse.return_value.status = failure
+                else:
+                    first.request.side_effect = failure
+                second.getresponse.return_value.status = 204
+                with patch("agent_session._UnixHTTPConnection", side_effect=[first, second]):
+                    with self.assertRaises((RuntimeError, OSError)):
+                        sess.close()
+                    self.assertEqual(sess.session_id, "synthetic-session")
+                    self.assertEqual(sess.gateway_token, "synthetic-token")
+                    first.close.assert_called_once()
+                    sess.close()
+                    second.request.assert_called_once_with("DELETE", "/sessions/synthetic-session")
+                self.assertIsNone(sess.session_id)
+                self.assertIsNone(sess.gateway_token)
+
+    def test_delete_of_already_absent_session_is_successful(self):
+        sess = AgentSession(self.owner_sock, None)
+        sess.session_id = "synthetic-session"
+        conn = Mock()
+        conn.getresponse.return_value.status = 404
+        with patch("agent_session._UnixHTTPConnection", return_value=conn):
+            sess.close()
+        self.assertIsNone(sess.session_id)
+        conn.close.assert_called_once()
+
 
 class RuntimeAgentCleanupTest(unittest.TestCase):
     def setUp(self):
@@ -219,6 +255,178 @@ class RuntimeAgentCleanupTest(unittest.TestCase):
         self.assertEqual(len(self.mock.created), 1)
         self.assertTrue(self.mock.created[0]["default"])
         self.assertEqual(self.mock.deleted, [self.mock.created[0]["session"]])
+
+
+class RuntimeShutdownFailuresTest(unittest.TestCase):
+    runtimes = (rc, rcc, rp)
+
+    def session(self, runtime):
+        session = runtime.Session.__new__(runtime.Session)
+        session.agent_session = Mock()
+        session.executor = Mock(containers_stopped=True)
+        session.broker = Mock()
+        session.broker.poll.return_value = None
+        session.broker.wait.return_value = 0
+        session.broker.communicate.return_value = ("", None)
+        session.broker_log = Mock()
+        session.sockdir = None
+        session.out = Mock()
+        return session
+
+    def test_all_runtimes_attempt_every_independent_step_and_aggregate_failures(self):
+        for runtime in self.runtimes:
+            with self.subTest(runtime=runtime.__name__):
+                session = self.session(runtime)
+                authority, broker, log = session.agent_session, session.broker, session.broker_log
+                authority.close.side_effect = OSError("owner unavailable")
+                broker.terminate.side_effect = OSError("terminate rejected")
+                broker.wait.side_effect = subprocess.TimeoutExpired("synthetic broker", 5)
+                broker.kill.side_effect = OSError("kill rejected")
+                log.close.side_effect = OSError("log close failed")
+                session.executor.stop.side_effect = RuntimeError("Docker failed")
+                with self.assertRaises(CleanupError) as error:
+                    session.stop()
+                for message in ("owner unavailable", "terminate rejected", "kill rejected",
+                                "exit after kill", "log close failed", "Docker failed"):
+                    self.assertIn(message, str(error.exception))
+                authority.close.assert_called_once()
+                broker.kill.assert_called_once()
+                self.assertEqual(broker.wait.call_count, 2)
+                log.close.assert_called_once()
+                session.executor.stop.assert_called_once()
+                self.assertIs(session.agent_session, authority)
+                self.assertIs(session.broker, broker)
+                self.assertIs(session.broker_log, log)
+
+    def test_all_runtimes_await_kill_and_retry_failed_authority_revocation(self):
+        for runtime in self.runtimes:
+            with self.subTest(runtime=runtime.__name__):
+                session = self.session(runtime)
+                authority, broker = session.agent_session, session.broker
+                authority.close.side_effect = [OSError("owner temporarily unavailable"), None]
+                broker.wait.side_effect = [subprocess.TimeoutExpired("synthetic broker", 1), 0]
+                with self.assertRaisesRegex(CleanupError, "owner temporarily unavailable"):
+                    session.stop()
+                broker.kill.assert_called_once()
+                self.assertEqual(broker.wait.call_count, 2)
+                self.assertEqual(broker.wait.call_args.kwargs, {"timeout": 5})
+                broker.stdout.read.assert_not_called()
+                self.assertIsNone(session.broker)
+                self.assertIsNone(session.broker_log)
+                self.assertIs(session.agent_session, authority)
+                session.stop()
+                self.assertIsNone(session.agent_session)
+                self.assertEqual(authority.close.call_count, 2)
+                self.assertEqual(broker.kill.call_count, 1)
+
+    def test_all_runtimes_retain_socket_directory_until_processes_stop(self):
+        for runtime in self.runtimes:
+            for live in ("broker", "container"):
+                with self.subTest(runtime=runtime.__name__, live=live), tempfile.TemporaryDirectory() as tmp:
+                    session = self.session(runtime)
+                    session.sockdir = Path(tmp) / "sockets"
+                    session.sockdir.mkdir()
+                    if live == "broker":
+                        session.broker.wait.side_effect = subprocess.TimeoutExpired("synthetic broker", 1)
+                    else:
+                        session.executor.containers_stopped = False
+                    with self.assertRaisesRegex(CleanupError, "retain broker directory"):
+                        session.stop()
+                    self.assertTrue(session.sockdir.exists())
+                    if session.broker is not None:
+                        session.broker.wait.side_effect = None
+                    session.executor.containers_stopped = True
+                    session.stop()
+                    self.assertIsNone(session.sockdir)
+                    self.assertFalse((Path(tmp) / "sockets").exists())
+
+    def test_all_runtimes_attempt_broker_cleanup_after_docker_failure(self):
+        for runtime in self.runtimes:
+            with self.subTest(runtime=runtime.__name__):
+                session = self.session(runtime)
+                authority, broker = session.agent_session, session.broker
+                session.executor.stop.side_effect = RuntimeError("Docker removal failure")
+                with self.assertRaisesRegex(CleanupError, "Docker removal failure"):
+                    session.stop()
+                authority.close.assert_called_once()
+                broker.terminate.assert_called_once()
+                broker.wait.assert_called_once()
+                self.assertIsNone(session.agent_session)
+                self.assertIsNone(session.broker)
+
+    def test_broker_summary_timeout_does_not_skip_executor_cleanup(self):
+        for runtime in (rc, rcc):
+            with self.subTest(runtime=runtime.__name__):
+                session = self.session(runtime)
+                broker = session.broker
+                broker.communicate.side_effect = subprocess.TimeoutExpired("synthetic summary", 1)
+                with self.assertRaisesRegex(CleanupError, "collect broker summary"):
+                    session.stop()
+                broker.communicate.assert_called_once_with(timeout=1)
+                broker.stdout.close.assert_called_once()
+                session.executor.stop.assert_called_once()
+                self.assertIsNone(session.broker)
+
+    def test_all_runtimes_preserve_startup_context_when_cleanup_fails(self):
+        for runtime in self.runtimes:
+            with self.subTest(runtime=runtime.__name__):
+                session = self.session(runtime)
+                session.gf_home = Path("/synthetic/home")
+                original = RuntimeError("original owner startup error")
+                with patch.object(runtime, "read_approver_socket", side_effect=original), \
+                        patch.object(session, "stop", side_effect=RuntimeError("rollback failed")):
+                    with self.assertRaisesRegex(RuntimeError, "original owner startup error.*rollback failed") as error:
+                        if runtime is rc:
+                            session.start()
+                        elif runtime is rcc:
+                            session.start("synthetic prompt", 1)
+                        else:
+                            session.start(Path("/synthetic/agent.py"), "synthetic-model", "synthetic task")
+                chain = error.exception
+                while chain is not None and chain is not original:
+                    chain = chain.__cause__
+                self.assertIs(chain, original)
+
+    def test_cli_cleanup_reports_both_failures_and_preserves_existing_exit_status(self):
+        for status, expected in ((0, 1), (1, 1), (130, 130)):
+            with self.subTest(status=status):
+                session, transcript = Mock(), Mock()
+                session.stop.side_effect = RuntimeError("session cleanup failed")
+                transcript.close.side_effect = OSError("transcript close failed")
+                with patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                    self.assertEqual(finish_cli_cleanup(session, transcript, status), expected)
+                self.assertIn("session cleanup failed", stderr.getvalue())
+                self.assertIn("transcript close failed", stderr.getvalue())
+                session.stop.assert_called_once()
+
+    def test_each_cli_reports_successful_run_but_failed_cleanup_as_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "codex").write_text("synthetic binary placeholder")
+            script = base / "agent.py"
+            script.write_text("# synthetic script placeholder")
+            for runtime in self.runtimes:
+                with self.subTest(runtime=runtime.__name__):
+                    session = Mock(gf_home=base, dir=base)
+                    proc = session.start.return_value
+                    proc.stdout = []
+                    proc.returncode = 0
+                    session.stop.side_effect = RuntimeError("synthetic cleanup failure")
+                    args = ["--workspace", tmp]
+                    if runtime is rc:
+                        args += ["--codex-bin-dir", tmp, "--prompt", "synthetic", "--once"]
+                    elif runtime is rcc:
+                        args += ["--prompt", "synthetic"]
+                    else:
+                        args += ["--agent-file", str(script), "--task", "synthetic"]
+                    with patch.object(runtime, "Session", return_value=session), \
+                            patch.object(rc, "run_turns", return_value=1), \
+                            patch("signal.signal"), \
+                            patch("sys.stdout", new_callable=io.StringIO), \
+                            patch("sys.stderr", new_callable=io.StringIO) as stderr:
+                        self.assertEqual(runtime.main(args), 1)
+                    self.assertIn("synthetic cleanup failure", stderr.getvalue())
+                    session.stop.assert_called_once()
 
 
 class HostPathTest(unittest.TestCase):

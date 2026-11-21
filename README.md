@@ -14,9 +14,9 @@ these controls cover.
   GuardFil's broker, which holds the key and enforces a spending limit.
 - **Documentation:** Full user and operator guide in [docs/guide/](docs/guide/README.md).
 
-> **Alpha: [`v0.1.0-alpha.2`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.2).**
+> **Alpha: [`v0.1.0-alpha.3`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.3).**
 > Linux with Docker, for one person on one machine. Install from source using
-> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.2.md)
+> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.3.md)
 > and [limits](#limits) before relying on it. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
 > Licensed under the [GNU AGPL v3](LICENSE).
 
@@ -43,7 +43,7 @@ agents do not start: there is no fallback to the raw folder. See
 **1. Get GuardFil and set it up** (once):
 
 ```sh
-git clone --branch v0.1.0-alpha.2 --single-branch https://github.com/reviaro/GuardFil.git
+git clone --branch v0.1.0-alpha.3 --single-branch https://github.com/reviaro/GuardFil.git
 cd GuardFil
 deployments/local/guardfil-local.sh init --ui active
 ```
@@ -83,7 +83,8 @@ deployments/local/guardfil-local.sh run-agent --runtime codex \
   --workspace ~/my-project --prompt "Run the tests" --once
 ```
 
-The agent sees only `--workspace`. Each call it makes is printed with
+The selected project is exposed through the mediated `--workspace` view;
+runtimes also receive their explicit helper, state and socket mounts. Each supported call is printed with
 GuardFil's decision, and recorded in `~/.guardfil-local/state/decisions.jsonl`
 and the web UI.
 
@@ -96,8 +97,9 @@ and the web UI.
 - allows Claude Code's read tools;
 - blocks writes naming files your machine runs later, outside the boundary, in the
   workspace or any folder below it: git hooks and config (`.git/`, `.githooks/`, `.husky/`, `.pre-commit-config.yaml`),
-  direnv and mise (`.envrc`, `.mise.toml`, `mise.toml`) and editor or dev-container
-  config (`.vscode/`, `.idea/`, `.zed/`, `.devcontainer/`). To allow one, delete its
+  direnv and mise (`.envrc`, `.mise.toml`, `mise.toml`, their local overrides,
+  `.mise/`, `mise/`) and editor or dev-container
+  config (`.vscode/`, `.idea/`, `.zed/`, `.devcontainer/`, `.devcontainer.json`). To allow one, delete its
   `block-host-run-*` rule in the Policy tab. To be asked first instead, delete it
   and add an "Ask me" rule for File writes on that path;
 - blocks the agents' own settings folders and everything else.
@@ -167,7 +169,9 @@ for the owner protocol.
 
 - **The executor** has a read-only root, every capability dropped,
   `no-new-privileges`, limits on processes, memory and CPU, and no network.
-  Its only writable places are your workspace and a small `/tmp`.
+  Writable locations include your mediated workspace, a small `/tmp` and
+  explicit runtime state or socket mounts. Session homes are untrusted output
+  outside workspace policy mediation.
 - **The model's traffic** goes to a relay on the executor's own loopback,
   which passes exactly one request shape to the host broker. The broker
   checks the request, adds the key, refuses provider-side tools (web search,
@@ -191,9 +195,12 @@ for the owner protocol.
 ## Evidence
 
 - Release verification covered
-  **155 browser and restart checks**, **32 headless checks**, **23 filesystem
-  tests** on real FUSE mounts and **11 Python-runtime checks** in the real
-  executor, including saved rules surviving restart and working without the UI.
+  **155 browser and restart checks**, **32 headless checks**, **32 filesystem
+  tests** on real FUSE mounts (plus nested/bind mount checks and **5 real
+  Docker bind-mount admission checks**), **141 Python unit tests**,
+  deterministic Go ledger fault-injection tests, and **11 Python-runtime
+  checks** in the real executor, including saved rules surviving restart and
+  working without the UI.
   These are bounded checks, not exhaustive browser or input coverage.
 - An escape suite (27 attempts: network, relay, host, GuardFil's own state
   and secrets) runs in CI against a real executor, and every attempt must
@@ -203,11 +210,9 @@ for the owner protocol.
   runs with no API key. CI installs pinned versions of both runtimes and runs both halves.
 - A live, model-driven red-team run against Codex held before the alpha.
 - Hosted CI runs three jobs on every commit: verification, executor and
-  native-agent checks (including real nested mounts), and the clean-runner
-  quickstart. All passed on the merged code
-  before the release was prepared; the
-  [release notes](docs/releases/v0.1.0-alpha.2.md#verification) say what the
-  release adds to that code.
+  native-agent checks (including real nested mounts and real Docker bind
+  admission), and the clean-runner quickstart. See the
+  [release notes](docs/releases/v0.1.0-alpha.3.md#verification) for details.
 - These checks use scripted provider stand-ins. The last live-model runs
   predate the alpha releases.
 
@@ -221,6 +226,13 @@ for the owner protocol.
   and external tool calls stop, and its workspace outputs must remain in
   local-only paths. This also stops cloud-driven agent turns; it does not
   switch to a local model. See [local-only data](docs/guide/workspace-and-commands.md#local-only-data).
+- Filesystem alias checks cover hard links, visible bind aliases and
+  non-cyclic in-workspace symlinks (refusing cycle-bearing directory symlinks,
+  `..` after normal relative-link components, and failing closed above 1,024
+  expanded names); extra raw mounts are also checked against hard links and
+  `/proc/self/mountinfo` workspace aliases, though other shared storage is not
+  detected. Use disposable, non-sensitive workspaces for evaluation. See
+  [filesystem alias limits](docs/guide/workspace-and-commands.md#filesystem-alias-limits).
 - The mediated workspace needs Linux, FUSE 3, `openat2` and the
   administrator-enabled `user_allow_other` setting. It supports
   concurrent overlapping sessions, contained links and ordinary storage
@@ -236,18 +248,25 @@ for the owner protocol.
   shell commands. The gateway does not follow redirects; native WebFetch checks
   only its initial URL. They are not a general network firewall.
 - The host-run blocks don't cover build files you run yourself (`Makefile`,
-  `package.json` scripts, `.npmrc`). Review agent changes before you build. Shell commands are decided by the shell
+  `package.json` scripts, `.npmrc`), arbitrary `.code-workspace` filenames or
+  every application-specific config name. Existing installations must
+  [merge new starter rules explicitly](docs/guide/policy.md#walkthrough-the-starter-policy).
+  Review agent changes before you build. Shell commands are decided by the shell
   rules, which ask you by default.
 - The supported quickstart is local and single-user; the UI uses loopback
   HTTP. Remote hosting and SSO are outside this alpha's scope.
-- The Go ledger's crash-durability cases (a failed write or fsync) are not
-  yet tested.
+- The Go ledger has deterministic write, sync, close and rename failure tests,
+  including recovery on reopening. These do not simulate power loss or prove
+  storage hardware durability.
 - Ambiguous provider billing keeps the reservation and halts further spend;
   it does not assume a zero-cost response.
 - Claude Code refused to act as an adversarial red-teamer, so its live
   red-team is scripted, not model-driven.
-- The independent security audit is partial: two executor/host-file units
-  remain unreviewed. Confirmed findings were fixed.
+- The security audit remains partial. Subsequent bounded AI reviews covered
+  the executor, host-file policy, mediated filesystem and runtime mounts, and
+  identified defects that have fixes applied within the filesystem and
+  runtime-mount limits described above. It is not a comprehensive or
+  third-party certification.
 
 ## For developers
 

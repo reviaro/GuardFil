@@ -1,5 +1,7 @@
 package budget
 
+import "fmt"
+
 // ReservationPermit is issued upon a successful durable reservation.
 type ReservationPermit struct {
 	PermitID             string `json:"permit_id"`
@@ -47,9 +49,25 @@ type SettlementCommittedHandleDisabledOutcome struct {
 	OutputTokens             int    `json:"output_tokens"`
 	TotalTokens              int    `json:"total_tokens"`
 	SettledAtUTC             string `json:"settled_at_utc"`
-	Error                    string `json:"error"`
+	ErrorDetail              string `json:"error"`
 	HandleDisabled           bool   `json:"handle_disabled"`
 	IsCommitted              bool   `json:"is_committed"`
+	Err                      error  `json:"-"`
+}
+
+func (s *SettlementCommittedHandleDisabledOutcome) Error() string {
+	if s.ErrorDetail != "" {
+		return fmt.Sprintf("settlement committed but confirmation publication failed: %s", s.ErrorDetail)
+	}
+	return "settlement committed but confirmation publication failed"
+}
+
+func (s *SettlementCommittedHandleDisabledOutcome) Unwrap() error {
+	return s.Err
+}
+
+func (s *SettlementCommittedHandleDisabledOutcome) Is(target error) bool {
+	return target == ErrLedgerHalted
 }
 
 // FailureResult is the outcome when a reservation fails and its funds are retained.

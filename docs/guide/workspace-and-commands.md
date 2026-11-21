@@ -33,8 +33,12 @@ allowing a read tool alone no longer grants filesystem access:
 The starter policy includes that grant. Add narrower Block rules in the
 Policy tab for files the agent must not read. Blocks take precedence over
 grants. Keep runtime binaries, GuardFil configuration and
-session state outside the selected workspace: additional mounts that
-overlap its original directory are rejected.
+session state outside the selected workspace: runtime launchers copy only the
+required executables into a private per-session directory with fresh inodes,
+and additional raw mounts are rejected if their pathnames overlap the
+workspace, if they contain hard-linked files (up to 1,024 inspected entries), or
+if `/proc/self/mountinfo` shows a direct or nested bind alias of the workspace
+storage. Keep runtime and session directories dedicated to their purpose.
 
 Multiple sessions can use the same workspace, overlapping parent/child
 directories or separate worktrees. Helpers coordinate namespace changes and
@@ -45,15 +49,24 @@ session's conflicting work.
 ## Filesystem behavior
 
 Paths in policy use the agent's `/workspace` namespace. The filesystem checks
-the opened backing object as well as its requested path. Symlinks that stay
-inside the workspace can work; access to their targets must also be allowed.
+the opened backing object and the names available to its filesystem callbacks.
+Symlinks that stay inside the workspace without forming directory cycles
+work; access to their targets must also be allowed. Cycle-bearing directory
+symlinks (such as `self -> .`) are refused on traversal, and relative symlink
+targets may only use leading `..` components (`..` after a normal component
+is refused on creation and move). A path reached through an in-workspace
+symlink, including a descendant beneath a directory symlink or a chain of
+symlinks, is checked under both its symlink name and its target name, so read,
+write and local-only rules on either name apply.
 Absolute symlinks into the selected source or `/workspace` are translated
 into links within the view. Hard links work when every alias is inside the
 selected source and permitted by policy. A link with an unaccounted-for
 alias outside the workspace is refused.
 
 Nested ordinary-storage mounts and bind aliases are supported, with checks
-against all visible names of an object. Supported filesystem types are
+against visible names of existing objects. New entries, links and rename
+destinations are checked under every visible alias of the destination
+directory. Supported filesystem types are
 ext2/3/4, XFS, Btrfs, tmpfs, overlayfs, NFS, CIFS/SMB2, F2FS and ramfs;
 this is not a claim of testing every implementation. Kernel API filesystems
 such as procfs/sysfs, device nodes, other FUSE sources, escaping symlinks,
@@ -62,10 +75,13 @@ directories, rename, append, truncate, permissions and timestamps work.
 
 A denied read hides the entry from directory listings and prevents operations
 that need to look it up, including writes to an existing unreadable file. Moving a directory
-requires access to its descendants, so renaming a parent cannot move a
-protected file outside its rule. Large directory moves are scanned in bounded
-batches without a fixed entry-count limit. Hard-link and bind-alias scans can
-be expensive; large-workspace performance has not been characterized.
+requires access to its descendants under every destination alias. A move
+that would leave a relative symlink pointing outside the workspace, either
+the link itself or one inside a moved directory, is refused.
+Large directory moves are scanned in bounded
+batches without a fixed entry-count limit. Hard-link, bind-alias and symlink
+alias scans can be expensive; large-workspace performance has not been
+characterized.
 Open file handles, including unlinked files, are checked again on each read and write;
 policy changes and decision-service failure therefore apply to later IO.
 Data already read by an agent cannot be recalled.
@@ -87,8 +103,27 @@ Supported native read/search hooks defer workspace access checks to the
 mediated filesystem; their tool-level rules still apply.
 
 These controls apply inside GuardFil's executor. Host applications still
-access the original directory normally. Review agent-written scripts before
-running them on the host.
+access the original directory normally. Review agent-written scripts and
+symlink destinations before using the output on the host.
+
+### Filesystem alias limits
+
+Alias checks cover hard links, bind aliases visible in the mount table and
+non-cyclic symlinks inside the workspace. Symlink resolution follows at most
+40 hops, ignores pre-existing escaping links during scans (the view refuses
+traversing them), refuses traversal through cycle-bearing directory symlinks,
+and fails closed if alias expansion exceeds 1,024 names. Raw runtime mounts
+are checked against hard-linked files (up to 1,024 inspected entries) and
+`/proc/self/mountinfo` bind aliases of the workspace storage, including storage
+mounted beneath the workspace; storage shared by other means (an overlay lower
+directory, the same network export mounted twice) is not detected. Any
+hard-linked file in a raw mount is refused, whether or not it is linked to the
+workspace. A launcher that is killed leaves its copied executables in the
+session directory under `sessions/`; the next Codex or Claude Code launch
+removes them once no container of that session remains. Keep runtime and
+session directories dedicated to their purpose. Bind mounts and symlinks are
+rescanned for each mediated namespace operation. This version is an alpha:
+use disposable, non-sensitive workspaces while evaluating it.
 
 ## Local-only data
 
@@ -103,7 +138,9 @@ local_only_paths:
 
 This classification applies to every agent. It does not grant read or write
 permission; ordinary file rules still decide access. Once a session reads a
-classified file, GuardFil keeps that session local for the rest of its life:
+path that the filesystem reports as classified, GuardFil keeps that session
+local for the rest of its life, including when the path is reached
+through an in-workspace symlink:
 
 - Host brokers refuse further provider requests, including token counting
   and retries. External tool and gateway calls are blocked too.

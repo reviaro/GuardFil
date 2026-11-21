@@ -27,16 +27,22 @@ import (
 type Authorize func(ctx context.Context, write bool, paths ...string) error
 
 type Workspace struct {
-	mu          sync.Mutex
-	fd          int
-	coordinator int
-	controlDir  objectID
-	controlFile objectID
-	virtual     string
-	inodes      map[objectID]uint64
-	mountRoots  map[string]bool
-	authorize   Authorize
-	root        *node
+	mu             sync.Mutex
+	fd             int
+	coordinator    int
+	controlDir     objectID
+	controlFile    objectID
+	virtual        string
+	inodes         map[objectID]uint64
+	mountRoots     map[string]bool
+	authorize      Authorize
+	root           *node
+	symlinkMu      sync.Mutex
+	locked         bool
+	symlinksCached bool
+	cachedSymlinks []symlinkInfo
+	cyclicCached   bool
+	cachedCyclic   map[string]bool
 }
 
 type node struct {
@@ -63,6 +69,10 @@ func New(source, virtual string, authorize Authorize) (*Workspace, error) {
 	if err := w.openCoordinator(); err != nil {
 		w.Close()
 		return nil, fmt.Errorf("workspace coordination unavailable: %w", err)
+	}
+	if err := w.refreshMounts(); err != nil {
+		w.Close()
+		return nil, fmt.Errorf("workspace mounts unavailable: %w", err)
 	}
 	w.root = &node{w: w, id: statID(&st)}
 	// Detect kernel support now, instead of silently falling back to pathname IO.
@@ -122,8 +132,9 @@ func (w *Workspace) Mount(mountpoint string, allowOther bool) (*fuse.Server, err
 		NullPermissions: true,
 		MountOptions: fuse.MountOptions{
 			Name: "guardfil", FsName: "guardfil-workspace", AllowOther: allowOther,
-			Options:       []string{"default_permissions", "nosuid", "nodev"},
-			DisableXAttrs: true,
+			Options:              []string{"default_permissions", "nosuid", "nodev"},
+			DisableXAttrs:        true,
+			EnableSymlinkCaching: false,
 		},
 	})
 }
@@ -234,7 +245,7 @@ func (w *Workspace) checkFD(ctx context.Context, fd int, original string, write 
 	if err != nil {
 		return nil, err
 	}
-	aliases, err := w.aliases(ctx, st)
+	aliases, err := w.aliases(ctx, st, actual)
 	if err != nil {
 		return nil, err
 	}
@@ -454,25 +465,56 @@ func (h *handle) Release(context.Context) syscall.Errno {
 func (h *handle) Fsync(context.Context, uint32) syscall.Errno { return fs.ToErrno(h.f.Sync()) }
 func (h *handle) Flush(context.Context) syscall.Errno         { return 0 }
 
-// parent pins the parent directory and authorizes the child under both its
-// requested name and the resolved parent. All namespace mutations use this FD.
-func (w *Workspace) parent(ctx context.Context, rel string) (int, string, error) {
+// destinationNames derives all destination names for rel using the pinned parent directory's
+// aliases and any dangling symlinks in the workspace.
+func (w *Workspace) destinationNames(ctx context.Context, rel string) (int, string, []string, error) {
 	if rel == "." || !filepath.IsLocal(rel) {
-		return -1, "", syscall.EACCES
+		return -1, "", nil, syscall.EACCES
 	}
-	fd, err := w.open(path.Dir(rel), unix.O_PATH|unix.O_DIRECTORY)
+	parentDir := path.Dir(rel)
+	base := path.Base(rel)
+	fd, err := w.open(parentDir, unix.O_PATH|unix.O_DIRECTORY)
 	if err != nil {
-		return -1, "", err
+		return -1, "", nil, err
 	}
-	actual, _, err := w.actual(fd)
-	if err == nil {
-		err = w.check(ctx, true, rel, path.Join(actual, path.Base(rel)))
-	}
+	actual, st, err := w.actual(fd)
 	if err != nil {
 		unix.Close(fd)
-		return -1, "", err
+		return -1, "", nil, err
 	}
-	return fd, path.Base(rel), nil
+	aliases, err := w.aliases(ctx, st, actual)
+	if err != nil {
+		unix.Close(fd)
+		return -1, "", nil, err
+	}
+	parentSet := map[string]bool{parentDir: true, actual: true}
+	for _, a := range aliases {
+		parentSet[a] = true
+	}
+	var destNames []string
+	for p := range parentSet {
+		destNames = append(destNames, path.Join(p, base))
+	}
+	expanded, err := w.expandDestinationNames(ctx, destNames)
+	if err != nil {
+		unix.Close(fd)
+		return -1, "", nil, err
+	}
+	return fd, base, expanded, nil
+}
+
+// parent pins the parent directory and authorizes the child under all destination
+// names (including parent aliases and dangling symlinks). All namespace mutations use this FD.
+func (w *Workspace) parent(ctx context.Context, rel string) (int, string, []string, error) {
+	fd, base, names, err := w.destinationNames(ctx, rel)
+	if err != nil {
+		return -1, "", nil, err
+	}
+	if err := w.check(ctx, true, names...); err != nil {
+		unix.Close(fd)
+		return -1, "", nil, err
+	}
+	return fd, base, names, nil
 }
 
 func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
@@ -481,7 +523,7 @@ func (n *node) Create(ctx context.Context, name string, flags, mode uint32, out 
 	}
 	defer n.w.unlock()
 	rel := path.Join(n.relative(), name)
-	parent, base, err := n.w.parent(ctx, rel)
+	parent, base, _, err := n.w.parent(ctx, rel)
 	if err != nil {
 		return nil, nil, 0, fs.ToErrno(err)
 	}
@@ -505,7 +547,7 @@ func (n *node) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.En
 	}
 	defer n.w.unlock()
 	rel := path.Join(n.relative(), name)
-	parent, base, err := n.w.parent(ctx, rel)
+	parent, base, _, err := n.w.parent(ctx, rel)
 	if err != nil {
 		return nil, fs.ToErrno(err)
 	}
@@ -540,7 +582,7 @@ func (n *node) remove(ctx context.Context, name string, dir bool) syscall.Errno 
 	if err != nil {
 		return fs.ToErrno(err)
 	}
-	parent, base, err := n.w.parent(ctx, rel)
+	parent, base, _, err := n.w.parent(ctx, rel)
 	if err != nil {
 		return fs.ToErrno(err)
 	}
@@ -581,7 +623,17 @@ func (n *node) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 		return nil, syscall.EACCES
 	}
 	target, err := n.w.linkTarget(rel, string(buf[:size]))
-	return []byte(target), fs.ToErrno(err)
+	if err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	isCyclic, err := n.w.isCyclicLink(ctx, rel)
+	if err != nil {
+		return nil, fs.ToErrno(err)
+	}
+	if isCyclic {
+		return nil, syscall.ELOOP
+	}
+	return []byte(target), 0
 }
 
 func (w *Workspace) safeLink(rel, target string) bool {
@@ -610,6 +662,29 @@ func (w *Workspace) linkTarget(rel, target string) (string, error) {
 		}
 		return filepath.Rel(path.Dir(path.Join(w.virtual, rel)), path.Join(w.virtual, inside))
 	}
+
+	// Reject any '..' component that appears after a normal component.
+	// Inductive argument: leading '..' components walk real physical parent directories
+	// which cannot be redirected by symlinks; each later normal component either
+	// descends into a physical directory or is itself a symlink that satisfies this same
+	// invariant. Allowing '..' after a normal component would permit semantic dot-dot
+	// escapes where 'shortcut/..' ascends from the symlink's resolved destination rather
+	// than cancelling lexically. Residual limit: pre-existing host-created links that
+	// violate this invariant are already refused on traversal by the view but remain host state.
+	seenNormal := false
+	for _, comp := range strings.Split(target, "/") {
+		if comp == "" || comp == "." {
+			continue
+		}
+		if comp == ".." {
+			if seenNormal {
+				return "", syscall.EACCES
+			}
+		} else {
+			seenNormal = true
+		}
+	}
+
 	resolved := path.Clean(path.Join(path.Dir(path.Join(w.virtual, rel)), target))
 	if resolved != w.virtual && !strings.HasPrefix(resolved, w.virtual+"/") {
 		return "", syscall.EACCES
@@ -627,11 +702,16 @@ func (n *node) Symlink(ctx context.Context, target, name string, out *fuse.Entry
 	if err != nil {
 		return nil, fs.ToErrno(err)
 	}
-	parent, base, err := n.w.parent(ctx, rel)
+	parent, base, destNames, err := n.w.parent(ctx, rel)
 	if err != nil {
 		return nil, fs.ToErrno(err)
 	}
 	defer unix.Close(parent)
+	for _, dest := range destNames {
+		if _, err := n.w.linkTarget(dest, target); err != nil {
+			return nil, fs.ToErrno(err)
+		}
+	}
 	if err = unix.Symlinkat(target, parent, base); err != nil {
 		return nil, fs.ToErrno(err)
 	}
@@ -660,7 +740,12 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 		return syscall.EACCES
 	}
 	oldRel, newRel := path.Join(n.relative(), name), path.Join(other.relative(), newName)
-	if err := n.w.checkMove(ctx, oldRel, newRel); err != nil {
+	newFD, newBase, toNames, err := n.w.parent(ctx, newRel)
+	if err != nil {
+		return fs.ToErrno(err)
+	}
+	defer unix.Close(newFD)
+	if err := n.w.checkMove(ctx, oldRel, toNames); err != nil {
 		return fs.ToErrno(err)
 	}
 	// Replacement also removes a name for the destination object. Its other
@@ -674,21 +759,17 @@ func (n *node) Rename(ctx context.Context, name string, newParent fs.InodeEmbedd
 	} else if err != syscall.ENOENT {
 		return fs.ToErrno(err)
 	}
-	oldFD, oldBase, err := n.w.parent(ctx, oldRel)
+	oldFD, oldBase, _, err := n.w.parent(ctx, oldRel)
 	if err != nil {
 		return fs.ToErrno(err)
 	}
 	defer unix.Close(oldFD)
-	newFD, newBase, err := n.w.parent(ctx, newRel)
-	if err != nil {
-		return fs.ToErrno(err)
-	}
-	defer unix.Close(newFD)
 	return fs.ToErrno(unix.Renameat2(oldFD, oldBase, newFD, newBase, uint(flags)))
 }
 
-// Moving a directory cannot move a restricted descendant out of its rule.
-func (w *Workspace) checkMove(ctx context.Context, from, to string) error {
+// Moving a directory cannot move a restricted descendant out of its rule,
+// and moving a relative symlink cannot leave an escaping host link.
+func (w *Workspace) checkMove(ctx context.Context, from string, toNames []string) error {
 	if ctx.Err() != nil {
 		return syscall.EINTR
 	}
@@ -700,11 +781,35 @@ func (w *Workspace) checkMove(ctx context.Context, from, to string) error {
 	if err == nil {
 		_, err = w.checkFD(ctx, fd, from, true)
 	}
-	unix.Close(fd)
 	if err != nil {
+		unix.Close(fd)
 		return err
 	}
-	if err = w.check(ctx, true, to); err != nil {
+	toNames, err = w.expandDestinationNames(ctx, toNames)
+	if err != nil {
+		unix.Close(fd)
+		return err
+	}
+	if st.Mode&syscall.S_IFMT == syscall.S_IFLNK {
+		buf := make([]byte, 4096)
+		size, err := unix.Readlinkat(fd, "", buf)
+		unix.Close(fd)
+		if err != nil {
+			return err
+		}
+		if size == len(buf) {
+			return syscall.EACCES
+		}
+		storedTarget := string(buf[:size])
+		for _, dest := range toNames {
+			if _, err := w.linkTarget(dest, storedTarget); err != nil {
+				return syscall.EACCES
+			}
+		}
+	} else {
+		unix.Close(fd)
+	}
+	if err = w.check(ctx, true, toNames...); err != nil {
 		return err
 	}
 	if st.Mode&syscall.S_IFMT != syscall.S_IFDIR {
@@ -722,7 +827,12 @@ func (w *Workspace) checkMove(ctx context.Context, from, to string) error {
 			return err
 		}
 		for _, entry := range entries {
-			if err := w.checkMove(ctx, path.Join(from, entry.Name()), path.Join(to, entry.Name())); err != nil {
+			childFrom := path.Join(from, entry.Name())
+			childToNames := make([]string, len(toNames))
+			for i, to := range toNames {
+				childToNames[i] = path.Join(to, entry.Name())
+			}
+			if err := w.checkMove(ctx, childFrom, childToNames); err != nil {
 				return err
 			}
 		}

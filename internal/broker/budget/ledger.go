@@ -93,6 +93,14 @@ type BudgetLedger struct {
 
 	heldLeaseFD int
 	mu          sync.Mutex
+	fs          ledgerFS
+}
+
+func (l *BudgetLedger) getFS() ledgerFS {
+	if l != nil && l.fs != nil {
+		return l.fs
+	}
+	return defaultFS
 }
 
 func nowUTCStr() string {
@@ -156,48 +164,105 @@ func (l *BudgetLedger) withLock(fn func() error) error {
 	return fn()
 }
 
-func publishBytes(dir string, finalName string, tmpPrefix string, data []byte) error {
+type fileWriter interface {
+	Write(p []byte) (n int, err error)
+	Sync() error
+	Close() error
+}
+
+type dirSyncer interface {
+	Sync() error
+	Close() error
+}
+
+type ledgerFS interface {
+	CreateTempFile(path string) (fileWriter, error)
+	Rename(oldPath, newPath string) error
+	Remove(path string) error
+	OpenDir(path string) (dirSyncer, error)
+}
+
+type osFS struct{}
+
+func (osFS) CreateTempFile(path string) (fileWriter, error) {
+	return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+}
+
+func (osFS) Rename(oldPath, newPath string) error {
+	return os.Rename(oldPath, newPath)
+}
+
+func (osFS) Remove(path string) error {
+	return os.Remove(path)
+}
+
+func (osFS) OpenDir(path string) (dirSyncer, error) {
+	return os.Open(path)
+}
+
+var defaultFS ledgerFS = osFS{}
+
+func publishBytes(fs ledgerFS, dir string, finalName string, tmpPrefix string, data []byte) error {
+	if fs == nil {
+		fs = defaultFS
+	}
 	tmpName := fmt.Sprintf("%s%s", tmpPrefix, randomHex(16))
 	tmpPath := filepath.Join(dir, tmpName)
 	finalPath := filepath.Join(dir, finalName)
 
-	f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	f, err := fs.CreateTempFile(tmpPath)
 	if err != nil {
 		return fmt.Errorf("%w: cannot create temp file: %v", ErrLedgerSecurity, err)
 	}
 	cleanupTmp := func() {
-		_ = os.Remove(tmpPath)
+		_ = fs.Remove(tmpPath)
 	}
 
-	if _, err := f.Write(data); err != nil {
+	n, err := f.Write(data)
+	if err != nil {
 		_ = f.Close()
 		cleanupTmp()
 		return fmt.Errorf("write error: %w", err)
 	}
+	if n != len(data) {
+		_ = f.Close()
+		cleanupTmp()
+		return fmt.Errorf("short write error: wrote %d of %d bytes", n, len(data))
+	}
+
 	if err := f.Sync(); err != nil {
 		_ = f.Close()
 		cleanupTmp()
 		return fmt.Errorf("sync error: %w", err)
 	}
+
 	if err := f.Close(); err != nil {
 		cleanupTmp()
 		return fmt.Errorf("close error: %w", err)
 	}
 
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+	if err := fs.Rename(tmpPath, finalPath); err != nil {
 		cleanupTmp()
 		return fmt.Errorf("rename error: %w", err)
 	}
 
-	dirF, err := os.Open(dir)
-	if err == nil {
-		_ = dirF.Sync()
-		_ = dirF.Close()
+	dirF, err := fs.OpenDir(dir)
+	if err != nil {
+		return fmt.Errorf("directory open error: %w", err)
+	}
+
+	syncErr := dirF.Sync()
+	closeErr := dirF.Close()
+	if syncErr != nil {
+		return fmt.Errorf("directory sync error: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("directory close error: %w", closeErr)
 	}
 	return nil
 }
 
-func writeStateFile(dir string, state *LedgerState) error {
+func writeStateFile(fs ledgerFS, dir string, state *LedgerState) error {
 	state.UpdatedAtUTC = nowUTCStr()
 	encoded, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -217,7 +282,7 @@ func writeStateFile(dir string, state *LedgerState) error {
 	if _, err := ValidateAndReconcileStateStatic(stateMap, state.ExperimentID); err != nil {
 		return err
 	}
-	return publishBytes(dir, StateFilename, ".tmp_ledger_", encoded)
+	return publishBytes(fs, dir, StateFilename, ".tmp_ledger_", encoded)
 }
 
 func readStateFile(dir string, expectedExpID string) (*LedgerState, error) {
@@ -300,7 +365,10 @@ func readWitnessRecord(dir string, name string, expectedType string, expID strin
 	return ValidateWitnessRecord(data, expectedType, expID)
 }
 
-func armGuard(dir string, expID string) (int, error) {
+func armGuard(fs ledgerFS, dir string, expID string) (int, error) {
+	if fs == nil {
+		fs = defaultFS
+	}
 	guard, err := readWitnessRecord(dir, InspectionGuardFilename, RecordTypeInspectionGuard, expID)
 	if err != nil {
 		return 0, err
@@ -321,7 +389,10 @@ func armGuard(dir string, expID string) (int, error) {
 		return 0, fmt.Errorf("%w: inspection generation exhausted", ErrLedgerSecurity)
 	}
 
-	_ = os.Remove(filepath.Join(dir, InspectionCompletionFilename))
+	compPath := filepath.Join(dir, InspectionCompletionFilename)
+	if err := fs.Remove(compPath); err != nil && !os.IsNotExist(err) {
+		return 0, fmt.Errorf("remove completion witness failed: %w", err)
+	}
 
 	guardRec := WitnessRecord{
 		RecordType:   RecordTypeInspectionGuard,
@@ -330,13 +401,16 @@ func armGuard(dir string, expID string) (int, error) {
 		ArmedAtUTC:   nowUTCStr(),
 	}
 	guardEnc, _ := json.MarshalIndent(guardRec, "", "  ")
-	if err := publishBytes(dir, InspectionGuardFilename, ".tmp_guard_", guardEnc); err != nil {
+	if err := publishBytes(fs, dir, InspectionGuardFilename, ".tmp_guard_", guardEnc); err != nil {
 		return 0, err
 	}
 	return nextGen, nil
 }
 
-func completeGuard(dir string, expID string, gen int) error {
+func completeGuard(fs ledgerFS, dir string, expID string, gen int) error {
+	if fs == nil {
+		fs = defaultFS
+	}
 	compRec := WitnessRecord{
 		RecordType:     RecordTypeInspectionComp,
 		ExperimentID:   expID,
@@ -344,11 +418,11 @@ func completeGuard(dir string, expID string, gen int) error {
 		CompletedAtUTC: nowUTCStr(),
 	}
 	compEnc, _ := json.MarshalIndent(compRec, "", "  ")
-	return publishBytes(dir, InspectionCompletionFilename, ".tmp_comp_", compEnc)
+	return publishBytes(fs, dir, InspectionCompletionFilename, ".tmp_comp_", compEnc)
 }
 
 func (l *BudgetLedger) guardedState() (*LedgerState, error) {
-	gen, err := armGuard(l.ledgerDir, l.experimentID)
+	gen, err := armGuard(l.getFS(), l.ledgerDir, l.experimentID)
 	if err != nil {
 		if errors.Is(err, ErrGuardUnfinished) {
 			l.poisonHandle("UNFINISHED_INSPECTION_GUARD")
@@ -375,7 +449,7 @@ func (l *BudgetLedger) guardedState() (*LedgerState, error) {
 		l.releaseLease()
 		return nil, fmt.Errorf("%w: %s", ErrLedgerHalted, *state.HaltReason)
 	}
-	if err := completeGuard(l.ledgerDir, l.experimentID, gen); err != nil {
+	if err := completeGuard(l.getFS(), l.ledgerDir, l.experimentID, gen); err != nil {
 		l.poisonHandle("INSPECTION_COMPLETION_FAILED")
 		l.releaseLease()
 		return nil, err
@@ -401,6 +475,13 @@ func isLeaseHeld(dir string) bool {
 
 // Initialize initializes a brand new budget ledger in a non-existent directory.
 func Initialize(ledgerDir string, experimentID string) (*BudgetLedger, error) {
+	return initializeInternal(ledgerDir, experimentID, defaultFS)
+}
+
+func initializeInternal(ledgerDir string, experimentID string, fs ledgerFS) (*BudgetLedger, error) {
+	if fs == nil {
+		fs = defaultFS
+	}
 	if experimentID == "" {
 		experimentID = DefaultExperimentID
 	}
@@ -456,7 +537,7 @@ func Initialize(ledgerDir string, experimentID string) (*BudgetLedger, error) {
 		},
 	}
 
-	if err := writeStateFile(absDir, initialState); err != nil {
+	if err := writeStateFile(fs, absDir, initialState); err != nil {
 		return nil, err
 	}
 
@@ -467,7 +548,7 @@ func Initialize(ledgerDir string, experimentID string) (*BudgetLedger, error) {
 		ArmedAtUTC:   now,
 	}
 	guardEnc, _ := json.MarshalIndent(guardRec, "", "  ")
-	if err := publishBytes(absDir, InspectionGuardFilename, ".tmp_guard_", guardEnc); err != nil {
+	if err := publishBytes(fs, absDir, InspectionGuardFilename, ".tmp_guard_", guardEnc); err != nil {
 		return nil, err
 	}
 
@@ -478,7 +559,7 @@ func Initialize(ledgerDir string, experimentID string) (*BudgetLedger, error) {
 		CompletedAtUTC: now,
 	}
 	compEnc, _ := json.MarshalIndent(compRec, "", "  ")
-	if err := publishBytes(absDir, InspectionCompletionFilename, ".tmp_comp_", compEnc); err != nil {
+	if err := publishBytes(fs, absDir, InspectionCompletionFilename, ".tmp_comp_", compEnc); err != nil {
 		return nil, err
 	}
 
@@ -486,6 +567,7 @@ func Initialize(ledgerDir string, experimentID string) (*BudgetLedger, error) {
 		ledgerDir:    absDir,
 		experimentID: experimentID,
 		heldLeaseFD:  -1,
+		fs:           fs,
 	}, nil
 }
 
@@ -631,7 +713,7 @@ func (l *BudgetLedger) validateAndRecoverRecordsUnderLock(state *LedgerState, di
 		UncertainReservationIDs: affectedIDs,
 	})
 
-	if err := writeStateFile(dir, state); err != nil {
+	if err := writeStateFile(l.getFS(), dir, state); err != nil {
 		return nil, true, err
 	}
 	return state, true, nil
@@ -639,6 +721,13 @@ func (l *BudgetLedger) validateAndRecoverRecordsUnderLock(state *LedgerState, di
 
 // Open opens an existing budget ledger for runtime transactions.
 func Open(ledgerDir string) (*BudgetLedger, error) {
+	return openInternal(ledgerDir, defaultFS)
+}
+
+func openInternal(ledgerDir string, fs ledgerFS) (*BudgetLedger, error) {
+	if fs == nil {
+		fs = defaultFS
+	}
 	absDir, err := filepath.Abs(ledgerDir)
 	if err != nil {
 		return nil, err
@@ -687,6 +776,7 @@ func Open(ledgerDir string) (*BudgetLedger, error) {
 	b := &BudgetLedger{
 		ledgerDir:   absDir,
 		heldLeaseFD: -1,
+		fs:          fs,
 	}
 
 	var expID string
@@ -711,7 +801,7 @@ func Open(ledgerDir string) (*BudgetLedger, error) {
 		}
 
 		expID = guard.ExperimentID
-		gen, err := armGuard(absDir, expID)
+		gen, err := armGuard(fs, absDir, expID)
 		if err != nil {
 			if errors.Is(err, ErrGuardUnfinished) {
 				st, err2 := readStateFile(absDir, expID)
@@ -751,7 +841,7 @@ func Open(ledgerDir string) (*BudgetLedger, error) {
 			return nil
 		}
 
-		if err := completeGuard(absDir, expID, gen); err != nil {
+		if err := completeGuard(fs, absDir, expID, gen); err != nil {
 			return err
 		}
 
@@ -774,7 +864,7 @@ func Open(ledgerDir string) (*BudgetLedger, error) {
 				Reason:               r,
 				TimestampUTC:         state.UpdatedAtUTC,
 			})
-			if err := writeStateFile(absDir, state); err != nil {
+			if err := writeStateFile(fs, absDir, state); err != nil {
 				return err
 			}
 		}
@@ -932,7 +1022,7 @@ func (l *BudgetLedger) Reserve(requestID string, requestDigest string, amountMic
 			TimestampUTC:         reservedAt,
 		})
 
-		if err := writeStateFile(l.ledgerDir, state); err != nil {
+		if err := writeStateFile(l.getFS(), l.ledgerDir, state); err != nil {
 			l.poisonHandle("RESERVE_DURABLE_WRITE_FAILED")
 			return err
 		}
@@ -1068,8 +1158,8 @@ func (l *BudgetLedger) Settle(permit *ReservationPermit, receipt *Receipt) (*Set
 		}
 		intentEnc, _ := json.MarshalIndent(intentRec, "", "  ")
 		intentName := fmt.Sprintf("%s%s.json", IntentFilePrefix, permit.PermitID)
-		if err := publishBytes(l.ledgerDir, intentName, ".tmp_intent_", intentEnc); err != nil {
-			l.failAndHalt(state, pending, "SETTLEMENT_INTENT_WRITE_FAILED")
+		if err := publishBytes(l.getFS(), l.ledgerDir, intentName, ".tmp_intent_", intentEnc); err != nil {
+			_ = l.failAndHalt(state, pending, "SETTLEMENT_INTENT_WRITE_FAILED")
 			return err
 		}
 
@@ -1093,7 +1183,7 @@ func (l *BudgetLedger) Settle(permit *ReservationPermit, receipt *Receipt) (*Set
 			TimestampUTC:             settledAt,
 		})
 
-		if err := writeStateFile(l.ledgerDir, state); err != nil {
+		if err := writeStateFile(l.getFS(), l.ledgerDir, state); err != nil {
 			l.poisonHandle("SETTLEMENT_WRITE_FAILED")
 			return err
 		}
@@ -1116,9 +1206,9 @@ func (l *BudgetLedger) Settle(permit *ReservationPermit, receipt *Receipt) (*Set
 		}
 		confEnc, _ := json.MarshalIndent(confRec, "", "  ")
 		confName := fmt.Sprintf("%s%s.json", ConfirmationFilePrefix, permit.PermitID)
-		if err := publishBytes(l.ledgerDir, confName, ".tmp_confirm_", confEnc); err != nil {
+		if err := publishBytes(l.getFS(), l.ledgerDir, confName, ".tmp_confirm_", confEnc); err != nil {
 			l.poisonHandle("SETTLEMENT_COMMITTED_CONFIRMATION_FAILED")
-			result = &SettlementResult{
+			return &SettlementCommittedHandleDisabledOutcome{
 				RequestID:                permit.RequestID,
 				PermitID:                 permit.PermitID,
 				ResponseID:               receipt.ResponseID,
@@ -1128,8 +1218,11 @@ func (l *BudgetLedger) Settle(permit *ReservationPermit, receipt *Receipt) (*Set
 				OutputTokens:             receipt.OutputTokens,
 				TotalTokens:              receipt.TotalTokens,
 				SettledAtUTC:             settledAt,
+				ErrorDetail:              err.Error(),
+				HandleDisabled:           true,
+				IsCommitted:              true,
+				Err:                      err,
 			}
-			return nil
 		}
 
 		l.releaseLease()
@@ -1154,7 +1247,7 @@ func (l *BudgetLedger) Settle(permit *ReservationPermit, receipt *Receipt) (*Set
 	return result, nil
 }
 
-func (l *BudgetLedger) failAndHalt(state *LedgerState, pending *PendingReservationData, reason string) {
+func (l *BudgetLedger) failAndHalt(state *LedgerState, pending *PendingReservationData, reason string) error {
 	if !AllowedInternalFailureCodes[reason] {
 		reason = "INVALID_FAILURE_REASON_REJECTED"
 	}
@@ -1175,8 +1268,11 @@ func (l *BudgetLedger) failAndHalt(state *LedgerState, pending *PendingReservati
 			Reason:               reason,
 			TimestampUTC:         state.UpdatedAtUTC,
 		})
-		_ = writeStateFile(l.ledgerDir, state)
+		if err := writeStateFile(l.getFS(), l.ledgerDir, state); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // RecordFailure atomically records failure for a pending reservation.
@@ -1200,19 +1296,21 @@ func (l *BudgetLedger) RecordFailure(permit *ReservationPermit, reason string) (
 		if permit == nil || permit.PermitID != pending.ReservationID ||
 			permit.RequestID != pending.RequestID ||
 			permit.RequestDigest != pending.RequestDigest {
-			l.failAndHalt(state, pending, "PERMIT_MISMATCH")
+			_ = l.failAndHalt(state, pending, "PERMIT_MISMATCH")
 			return ErrPermitMismatch
 		}
 
 		if !AllowedInternalFailureCodes[reason] {
-			l.failAndHalt(state, pending, "INVALID_FAILURE_REASON_REJECTED")
+			_ = l.failAndHalt(state, pending, "INVALID_FAILURE_REASON_REJECTED")
 			return fmt.Errorf("%w: invalid failure reason %s", ErrSettlementEvidence, reason)
 		}
 
 		retained := pending.ReservedAmountMicros
 		failedAt := nowUTCStr()
 
-		l.failAndHalt(state, pending, reason)
+		if err := l.failAndHalt(state, pending, reason); err != nil {
+			return err
+		}
 
 		result = &FailureResult{
 			RequestID:            permit.RequestID,
