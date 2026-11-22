@@ -33,7 +33,7 @@ from redteam.m5.fixture import App, Bridge, start
 
 IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
 PROMPTS = json.loads(Path(__file__).with_name("prompts.json").read_text())
-LEDGERS = {"codex": "t2a-experiment", "claude-code": "anthropic-experiment"}
+LEDGERS = {"codex": "openai", "claude-code": "anthropic"}
 ROOT = Path.home() / ".local/state/guardfil"
 
 POLICY = """schema_version: 1

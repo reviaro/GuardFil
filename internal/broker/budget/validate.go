@@ -271,7 +271,13 @@ func sortedKeys(m map[string]any) []string {
 
 // ValidateAndReconcileStateStatic validates and reconciles state map according to Python budget specifications.
 func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string) (*LedgerState, error) {
-	// 1. Top-level closed schema
+	// 1. Schema version and top-level closed schema
+	minV, maxV := SchemaVersion, SchemaVersionV2
+	schemaVersion, err := validateInt(state["schema_version"], "schema_version", minV, &maxV)
+	if err != nil {
+		return nil, fmt.Errorf("%w: Unsupported schema version: %v (expected %d or %d)", ErrLedgerCorrupt, state["schema_version"], SchemaVersion, SchemaVersionV2)
+	}
+
 	var missing, unexpected []string
 	for k := range expectedStateKeys {
 		if _, ok := state[k]; !ok {
@@ -279,20 +285,18 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 		}
 	}
 	for k := range state {
-		if !expectedStateKeys[k] {
-			unexpected = append(unexpected, k)
+		if expectedStateKeys[k] {
+			continue
 		}
+		if schemaVersion == SchemaVersionV2 && k == "legacy_experiment_id" {
+			continue
+		}
+		unexpected = append(unexpected, k)
 	}
 	if len(missing) > 0 || len(unexpected) > 0 {
 		sort.Strings(missing)
 		sort.Strings(unexpected)
 		return nil, fmt.Errorf("%w: State closed schema violation: missing=%v, unexpected=%v", ErrLedgerCorrupt, missing, unexpected)
-	}
-
-	// 2. Schema version
-	schemaV := SchemaVersion
-	if _, err := validateInt(state["schema_version"], "schema_version", schemaV, &schemaV); err != nil {
-		return nil, fmt.Errorf("%w: Unsupported schema version: %v (expected %d)", ErrLedgerCorrupt, state["schema_version"], SchemaVersion)
 	}
 
 	// 3. Timestamps
@@ -308,13 +312,23 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 		return nil, fmt.Errorf("%w: updated_at_utc (%s) precedes created_at_utc (%s)", ErrLedgerCorrupt, updatedStr, createdStr)
 	}
 
-	// 4. Experiment ID
+	// 4. Experiment ID (and optional schema-v2 legacy_experiment_id)
 	expID, err := validateIdentifier(state["experiment_id"], "experiment_id")
 	if err != nil {
 		return nil, err
 	}
 	if expectedExpID != "" && expID != expectedExpID {
 		return nil, fmt.Errorf("%w: Experiment ID mismatch: %q (expected %q)", ErrLedgerCorrupt, expID, expectedExpID)
+	}
+	var legacyExpID string
+	if rawLegacy, hasLegacy := state["legacy_experiment_id"]; hasLegacy {
+		legacyExpID, err = validateIdentifier(rawLegacy, "legacy_experiment_id")
+		if err != nil {
+			return nil, err
+		}
+		if legacyExpID == expID {
+			return nil, fmt.Errorf("%w: legacy_experiment_id must differ from experiment_id (%q)", ErrLedgerCorrupt, expID)
+		}
 	}
 
 	// 5. Ceiling & reservation amount
@@ -437,8 +451,12 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 	if !ok || len(journalRaw) == 0 {
 		return nil, fmt.Errorf("%w: journal must be a non-empty list", ErrLedgerCorrupt)
 	}
-	if len(journalRaw) > MaxJournalEntries {
-		return nil, fmt.Errorf("%w: journal exceeds maximum length of %d", ErrLedgerCorrupt, MaxJournalEntries)
+	maxEntries := MaxJournalEntries
+	if schemaVersion == SchemaVersionV2 && legacyExpID != "" {
+		maxEntries = MaxMigratedJournalEntries
+	}
+	if len(journalRaw) > maxEntries {
+		return nil, fmt.Errorf("%w: journal exceeds maximum length of %d", ErrLedgerCorrupt, maxEntries)
 	}
 
 	// Entry 0: INITIALIZED
@@ -449,7 +467,11 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 	if err := checkClosedSchema(initMap, journalKeys["INITIALIZED"], "INITIALIZED journal entry"); err != nil {
 		return nil, err
 	}
-	if initMap["experiment_id"] != expID {
+	expectedInitExpID := expID
+	if legacyExpID != "" {
+		expectedInitExpID = legacyExpID
+	}
+	if initMap["experiment_id"] != expectedInitExpID {
 		return nil, fmt.Errorf("%w: INITIALIZED entry experiment_id mismatch", ErrLedgerCorrupt)
 	}
 	initCeiling, err := validateInt(initMap["global_ceiling_micros"], "INITIALIZED entry global_ceiling_micros", GlobalCeilingMicros, &cVal)
@@ -464,7 +486,7 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 	journalEntries := make([]JournalEntry, len(journalRaw))
 	journalEntries[0] = JournalEntry{
 		EntryType:           "INITIALIZED",
-		ExperimentID:        expID,
+		ExperimentID:        expectedInitExpID,
 		GlobalCeilingMicros: initCeiling,
 		TimestampUTC:        initTs,
 	}
@@ -477,6 +499,7 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 	var activeRes map[string]any
 	var hasTerminalHalt bool
 	var hasTerminalUncertainty bool
+	var sawMigrated bool
 	var uncertainSettledCount int
 	var terminalHaltReason string
 	var jSettledAmount, jRetainedAmount, jRetainedCount, jSettledCount, jReservedCount int
@@ -490,7 +513,7 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 		if !ok || !ValidJournalEntryTypes[etype] || etype == "INITIALIZED" {
 			return nil, fmt.Errorf("%w: Forbidden or malformed journal entry type at index %d: %v", ErrLedgerCorrupt, idx, entry["entry_type"])
 		}
-		if hasTerminalHalt {
+		if hasTerminalHalt && (etype != "MIGRATED" || schemaVersion != SchemaVersionV2) {
 			return nil, fmt.Errorf("%w: Event found at index %d after terminal halt had already occurred", ErrLedgerCorrupt, idx)
 		}
 		ts, _, err := validateTimestamp(entry["timestamp_utc"])
@@ -737,7 +760,13 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 			}
 
 		case "TERMINAL_UNCERTAINTY":
-			if idx != len(journalRaw)-1 {
+			nextIsMigrated := false
+			if schemaVersion == SchemaVersionV2 && idx == len(journalRaw)-2 {
+				if nextMap, ok := journalRaw[idx+1].(map[string]any); ok && nextMap["entry_type"] == "MIGRATED" {
+					nextIsMigrated = true
+				}
+			}
+			if idx != len(journalRaw)-1 && !nextIsMigrated {
 				return nil, fmt.Errorf("%w: TERMINAL_UNCERTAINTY entry at index %d must be the final journal entry", ErrLedgerCorrupt, idx)
 			}
 			reason, ok := entry["reason"].(string)
@@ -798,7 +827,62 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 				UncertainReservationIDs: uids,
 				TimestampUTC:            ts,
 			}
+
+		case "MIGRATED":
+			if schemaVersion != SchemaVersionV2 || legacyExpID == "" {
+				return nil, fmt.Errorf("%w: MIGRATED entry requires schema_version %d and legacy_experiment_id", ErrLedgerCorrupt, SchemaVersionV2)
+			}
+			if sawMigrated {
+				return nil, fmt.Errorf("%w: duplicate MIGRATED journal entry at index %d", ErrLedgerCorrupt, idx)
+			}
+			if activeRes != nil {
+				return nil, fmt.Errorf("%w: MIGRATED entry at index %d is forbidden while a reservation is active", ErrLedgerCorrupt, idx)
+			}
+			mExpID, err := validateIdentifier(entry["experiment_id"], fmt.Sprintf("index %d experiment_id", idx))
+			if err != nil {
+				return nil, err
+			}
+			if mExpID != expID {
+				return nil, fmt.Errorf("%w: MIGRATED entry experiment_id mismatch: %q != %q", ErrLedgerCorrupt, mExpID, expID)
+			}
+			fromExpID, err := validateIdentifier(entry["from_experiment_id"], fmt.Sprintf("index %d from_experiment_id", idx))
+			if err != nil {
+				return nil, err
+			}
+			if fromExpID != legacyExpID {
+				return nil, fmt.Errorf("%w: MIGRATED entry from_experiment_id mismatch: %q != %q", ErrLedgerCorrupt, fromExpID, legacyExpID)
+			}
+			legacyDirName, err := validateIdentifier(entry["legacy_dir_name"], fmt.Sprintf("index %d legacy_dir_name", idx))
+			if err != nil {
+				return nil, err
+			}
+			reason, _ := entry["reason"].(string)
+			if reason != MigrationReasonCLI {
+				return nil, fmt.Errorf("%w: invalid MIGRATED reason at index %d: %q", ErrLedgerCorrupt, idx, reason)
+			}
+			maxGen := MaxInspectionGeneration
+			inspGen, err := validateInt(entry["inspection_generation"], fmt.Sprintf("index %d inspection_generation", idx), 2, &maxGen)
+			if err != nil {
+				return nil, err
+			}
+			sawMigrated = true
+			journalEntries[idx] = JournalEntry{
+				EntryType:            etype,
+				ExperimentID:         mExpID,
+				FromExperimentID:     fromExpID,
+				InspectionGeneration: inspGen,
+				LegacyDirName:        legacyDirName,
+				Reason:               reason,
+				TimestampUTC:         ts,
+			}
 		}
+	}
+
+	if legacyExpID != "" && !sawMigrated {
+		return nil, fmt.Errorf("%w: legacy_experiment_id set without MIGRATED journal entry", ErrLedgerCorrupt)
+	}
+	if sawMigrated && legacyExpID == "" {
+		return nil, fmt.Errorf("%w: MIGRATED journal entry present without legacy_experiment_id", ErrLedgerCorrupt)
 	}
 
 	// 11. Terminal halt validation
@@ -874,8 +958,9 @@ func ValidateAndReconcileStateStatic(state map[string]any, expectedExpID string)
 	}
 
 	return &LedgerState{
-		SchemaVersion:           SchemaVersion,
+		SchemaVersion:           schemaVersion,
 		ExperimentID:            expID,
+		LegacyExperimentID:      legacyExpID,
 		CreatedAtUTC:            createdStr,
 		UpdatedAtUTC:            updatedStr,
 		GlobalCeilingMicros:     GlobalCeilingMicros,

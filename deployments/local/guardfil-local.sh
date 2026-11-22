@@ -2,7 +2,7 @@
 # One-command local GuardFil: approval service, with or without the web UI.
 #
 #   deployments/local/guardfil-local.sh init [--ui none|inactive|active]   create $GF_HOME (once)
-#   deployments/local/guardfil-local.sh up                                 build and start
+#   deployments/local/guardfil-local.sh up [--no-build]                     build and start (or start a pre-built image)
 #   deployments/local/guardfil-local.sh ui none|inactive|active           change the UI switch and restart
 #   deployments/local/guardfil-local.sh catalog FILE                      install an app's tool catalog (kept with the agents' tools) and restart
 #   deployments/local/guardfil-local.sh credential NAME < SECRET          store an app credential for the gateway (from stdin)
@@ -211,13 +211,23 @@ cmd_init() {
 }
 
 cmd_up() {
+  local build_flag=--build
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-build) build_flag=--no-build; shift ;;
+      *) die "usage: $0 up [--no-build]" ;;
+    esac
+  done
   [ -f "$GF_HOME/config/guardfil.yaml" ] || die "run '$0 init' first"
+  if [ "$build_flag" = --no-build ]; then
+    docker image inspect guardfil-local:dev >/dev/null 2>&1 || die "guardfil-local:dev missing; build it from the repository root first (for example 'docker build --network=host -t guardfil-local:dev -f deployments/Dockerfile .') or run '$0 up'"
+  fi
   # Homes made before the owner socket existed get it now.
   if [ ! -d "$GF_HOME/owner" ] || ! grep -q approver_socket "$GF_HOME/config/guardfil.yaml"; then
     (umask 077; mkdir -p "$GF_HOME/owner")
     write_config "$(cat "$GF_HOME/config/.ui-mode" 2>/dev/null || echo none)"
   fi
-  "${COMPOSE[@]}" up --build -d
+  "${COMPOSE[@]}" up "$build_flag" -d
   local i
   for i in $(seq 1 50); do
     [ -S "$GF_HOME/run/approval.sock" ] && break
@@ -357,7 +367,7 @@ cmd_ui() {
 
 case "${1:-}" in
   init) shift; cmd_init "$@" ;;
-  up) cmd_up ;;
+  up) shift; cmd_up "$@" ;;
   down) "${COMPOSE[@]}" down ;;
   logs) "${COMPOSE[@]}" logs --tail 50 ;;
   status) cmd_status ;;

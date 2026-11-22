@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/reviaro/guardfil/internal/broker/budget"
@@ -24,19 +25,23 @@ func main() {
 func run(args []string) error {
 	if len(args) == 0 {
 		printUsage()
-		return errors.New("subcommand required: responses, messages, neutral, or relay")
+		return errors.New("subcommand required: responses, messages, neutral, relay, or migrate-ledger")
 	}
 
 	subcmd := args[0]
 	subArgs := args[1:]
 
-	// The brokers accept the built-in models plus the owner's model list.
-	if subcmd == "responses" || subcmd == "messages" || subcmd == "neutral" {
+	// The brokers (and migrate-ledger validation) accept built-in models plus
+	// the owner's model list.
+	if subcmd == "responses" || subcmd == "messages" || subcmd == "neutral" || subcmd == "migrate-ledger" {
 		if err := budget.LoadModels(budget.DefaultModelsPath()); err != nil {
 			return err
 		}
+		if subcmd == "migrate-ledger" {
+			return runMigrateLedger(subArgs)
+		}
 		err := runBroker(subcmd, subArgs)
-		if errors.Is(err, budget.ErrLedgerCorrupt) {
+		if errors.Is(err, budget.ErrLedgerCorrupt) && !errors.Is(err, budget.ErrMigrationState) {
 			return fmt.Errorf("%w (if you removed a model from ~/.config/guardfil/models.yaml or changed its price after using it, restore that entry)", err)
 		}
 		return err
@@ -69,10 +74,11 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `guardfil-broker - unified GuardFil broker and relay
 
 Subcommands:
-  responses  OpenAI Responses API broker for native Codex
-  messages   Anthropic Messages API broker for native Claude Code
-  neutral    Model-neutral broker for Python agent (OpenAI, Anthropic, Gemini)
-  relay      HTTP-to-Unix-socket local TCP relay
+  responses       OpenAI Responses API broker for native Codex
+  messages        Anthropic Messages API broker for native Claude Code
+  neutral         Model-neutral broker for Python agent (OpenAI, Anthropic, Gemini)
+  relay           HTTP-to-Unix-socket local TCP relay
+  migrate-ledger  Migrate legacy provider budget ledgers to schema v2 paths/IDs
 
 The brokers accept the built-in models plus those listed, with prices, in
 ~/.config/guardfil/models.yaml.
@@ -167,4 +173,41 @@ func runRelay(args []string) error {
 		SocketTimeoutSec: 130 * time.Second,
 	}
 	return relay.RunRelay(cfg)
+}
+
+func runMigrateLedger(args []string) error {
+	fs := flag.NewFlagSet("migrate-ledger", flag.ContinueOnError)
+	provider := fs.String("provider", "all", "Provider ledger to migrate: openai, anthropic, gemini, or all")
+	dryRun := fs.Bool("dry-run", false, "Validate and report migration actions without modifying disk state")
+	defaultRoot := filepath.Join(os.Getenv("HOME"), ".local/state/guardfil")
+	stateRoot := fs.String("state-root", defaultRoot, "Ledger state root directory")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("unexpected positional arguments: %v", fs.Args())
+	}
+
+	var targets []string
+	if *provider == "all" {
+		targets = budget.SupportedProviders
+	} else if _, ok := budget.ProviderLedgerSpecs[*provider]; ok {
+		targets = []string{*provider}
+	} else {
+		return fmt.Errorf("invalid --provider %q (want openai, anthropic, gemini, or all)", *provider)
+	}
+
+	var errs []error
+	for _, p := range targets {
+		res, err := budget.MigrateProviderLedger(*stateRoot, p, *dryRun)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "provider=%s error=%v\n", p, err)
+			errs = append(errs, fmt.Errorf("migrate %s ledger: %w", p, err))
+			continue
+		}
+		fmt.Printf("provider=%s status=%s committed_micros=%d retained_micros=%d reservations=%d halted=%t halt_reason=%s\n",
+			res.Provider, res.Status, res.CommittedSpendMicros, res.RetainedFailedMicros, res.TotalReservationsCount, res.Halted, res.HaltReason)
+	}
+	return errors.Join(errs...)
 }

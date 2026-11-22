@@ -405,6 +405,8 @@ type MessagesBrokerServer struct {
 	stopped       bool
 	busy          bool
 	stopRequested bool
+	stopMu        sync.Mutex
+	listener      net.Listener
 	mu            sync.Mutex
 	sleepFn       func(time.Duration)
 }
@@ -636,7 +638,16 @@ func (s *MessagesBrokerServer) HandleFrame(raw []byte) (int, []byte) {
 	return 200, resBody
 }
 
+func (s *MessagesBrokerServer) isStopRequested() bool {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	return s.stopRequested
+}
+
 func (s *MessagesBrokerServer) Serve(sockPath string) error {
+	if s.isStopRequested() {
+		return nil
+	}
 	_ = os.Remove(sockPath)
 	oldMask := syscall.Umask(0077)
 	l, err := net.Listen("unix", sockPath)
@@ -644,7 +655,21 @@ func (s *MessagesBrokerServer) Serve(sockPath string) error {
 	if err != nil {
 		return err
 	}
+	s.stopMu.Lock()
+	if s.stopRequested {
+		s.stopMu.Unlock()
+		_ = l.Close()
+		_ = os.Remove(sockPath)
+		return nil
+	}
+	s.listener = l
+	s.stopMu.Unlock()
 	defer func() {
+		s.stopMu.Lock()
+		if s.listener == l {
+			s.listener = nil
+		}
+		s.stopMu.Unlock()
 		_ = l.Close()
 		_ = os.Remove(sockPath)
 	}()
@@ -655,7 +680,7 @@ func (s *MessagesBrokerServer) Serve(sockPath string) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if s.stopRequested {
+			if s.isStopRequested() {
 				break
 			}
 			return err
@@ -665,7 +690,7 @@ func (s *MessagesBrokerServer) Serve(sockPath string) error {
 		s.handleConn(conn)
 		s.busy = false
 
-		if s.stopRequested {
+		if s.isStopRequested() {
 			break
 		}
 	}
@@ -706,7 +731,13 @@ func (s *MessagesBrokerServer) writeReply(conn net.Conn, status int, body []byte
 }
 
 func (s *MessagesBrokerServer) RequestStop() {
+	s.stopMu.Lock()
 	s.stopRequested = true
+	l := s.listener
+	s.stopMu.Unlock()
+	if l != nil {
+		_ = l.Close()
+	}
 }
 
 func RunMessagesBroker(sockdir string, label string, maxRequests int, evidencePath string) error {
@@ -732,8 +763,7 @@ func RunMessagesBroker(sockdir string, label string, maxRequests int, evidencePa
 	key := strings.TrimSpace(string(keyData))
 
 	stateRoot := filepath.Join(os.Getenv("HOME"), ".local/state/guardfil")
-	ledgerRoot := filepath.Join(stateRoot, "anthropic-experiment")
-	ledger, err := budget.OpenOrInitLedger(ledgerRoot, true, "guardfil-m4-anthropic")
+	ledger, err := budget.OpenProviderLedger(stateRoot, "anthropic", true)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to open Anthropic ledger: %v\n", err)
 		return err

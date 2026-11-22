@@ -2,6 +2,7 @@ package messages
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -411,4 +412,107 @@ func TestAllowedFailureCodesOnBadStatusAndMalformed(t *testing.T) {
 		t.Errorf("expected RECEIPT_SCHEMA_VIOLATION, got %v", st2.HaltReason)
 	}
 	cleanup2()
+}
+
+func TestServeStopsPromptlyOnRequestStop(t *testing.T) {
+	srv, _, _, cleanup := setupTestBroker(t, nil, nil, 0)
+	defer cleanup()
+
+	sockDir, err := os.MkdirTemp("", "gf-msg-stop-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "b.sock")
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.Serve(sockPath)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		srv.stopMu.Lock()
+		ready = srv.listener != nil
+		srv.stopMu.Unlock()
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !ready {
+		srv.RequestStop()
+		t.Fatal("Serve did not start listening within 2s")
+	}
+	// Let the Serve goroutine block inside Accept().
+	time.Sleep(20 * time.Millisecond)
+
+	srv.RequestStop()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("Serve returned unexpected error on stop: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not exit promptly after RequestStop")
+	}
+
+	if _, err := os.Stat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected socket path %s to be removed on exit, stat err=%v", sockPath, err)
+	}
+}
+
+func TestRequestStopBeforeServe(t *testing.T) {
+	srv, _, _, cleanup := setupTestBroker(t, nil, nil, 0)
+	defer cleanup()
+
+	sockDir, err := os.MkdirTemp("", "gf-msg-prestop-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(sockDir)
+	sockPath := filepath.Join(sockDir, "b.sock")
+
+	srv.RequestStop()
+	if err := srv.Serve(sockPath); err != nil {
+		t.Fatalf("expected nil from Serve after RequestStop, got %v", err)
+	}
+	if _, err := os.Stat(sockPath); !os.IsNotExist(err) {
+		t.Fatalf("expected no socket file %s after pre-stop, stat err=%v", sockPath, err)
+	}
+}
+
+func TestRunMessagesBrokerRefusesUnmigratedLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GUARDFIL_OWNER_SOCKET", "")
+	t.Setenv("GUARDFIL_SESSION_ID", "")
+
+	credDir := filepath.Join(home, ".config/guardfil/credentials.d")
+	if err := os.MkdirAll(credDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credDir, "anthropic-api-key"), []byte("sk-ant-fake\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := budget.ProviderLedgerSpecs["anthropic"]
+	legacyRoot := filepath.Join(home, ".local/state/guardfil", spec.LegacyDir)
+	if err := os.MkdirAll(legacyRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	l, err := budget.Initialize(filepath.Join(legacyRoot, "ledger"), spec.LegacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+
+	err = RunMessagesBroker(filepath.Join(t.TempDir(), "sock"), "legacyrefuse", 2, "")
+	if !errors.Is(err, budget.ErrLedgerMigrationRequired) {
+		t.Fatalf("expected ErrLedgerMigrationRequired, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".local/state/guardfil", spec.TargetDir)); !os.IsNotExist(statErr) {
+		t.Fatalf("target dir created despite unmigrated legacy")
+	}
 }

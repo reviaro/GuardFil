@@ -113,6 +113,17 @@ Local HTTP-to-Unix socket relay running in the container anchor.
 | `-socket-path` | Path | `/run/guardfil-broker/broker.sock` | Path to host broker Unix socket. |
 | `-host` | String | `127.0.0.1` | Local bind host address. |
 
+### Subcommand: `migrate-ledger`
+Inspects or migrates legacy schema-v1 provider budget ledgers (`t2a-experiment`, `anthropic-experiment`, `gemini-experiment-6`) to provider-named schema-v2 directories (`openai`, `anthropic`, `gemini`).
+
+| Flag | Type | Default | Description |
+| --- | --- | --- | --- |
+| `--provider` | String | `all` | Target provider: `openai`, `anthropic`, `gemini`, or `all`. |
+| `--dry-run` | Boolean | `false` | Validate and report planned actions without writing to disk. |
+| `--state-root` | Path | `~/.local/state/guardfil` | Parent directory containing provider ledger directories. |
+
+Prints one status line per provider (`provider=... status=... committed_micros=... retained_micros=... reservations=... halted=... halt_reason=...`). With `--provider all`, continues across all providers even if one fails and exits non-zero if any provider failed.
+
 ---
 
 ## 5. `guardfil-mcp-proxy` (`cmd/guardfil-mcp-proxy`)

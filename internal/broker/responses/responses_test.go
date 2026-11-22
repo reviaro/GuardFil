@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,6 +31,9 @@ var allowedEvidenceKeys = map[string]bool{
 	"response_body_sha256": true,
 	"event_type_counts":    true,
 	"outcome_code":         true,
+	"parse_error":          true,
+	"upstream_error_type":  true,
+	"upstream_error_code":  true,
 	"ledger_status":        true,
 	"timestamps":           true,
 }
@@ -735,5 +739,384 @@ func TestReservationForModelRegression(t *testing.T) {
 	t.Cleanup(func() { delete(budget.ModelRates, zeroRateModel) })
 	if amt, ok := responses.ReservationForModel(zeroRateModel, 100); ok || amt != 0 {
 		t.Fatalf("expected rejection for zero input rate, got %d, %v", amt, ok)
+	}
+}
+
+func TestSSEErrorEventRecordsSafeDiagnosticsWithoutLeakingMessage(t *testing.T) {
+	t.Run("top_level_code_with_response_created", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		expRoot := filepath.Join(tmpDir, "exp")
+		ledger, err := budget.Initialize(filepath.Join(expRoot, "ledger"), budget.DefaultExperimentID)
+		if err != nil {
+			t.Fatalf("init ledger: %v", err)
+		}
+		defer ledger.Close()
+
+		sse := strings.Join([]string{
+			`event: response.created`,
+			`data: {"type":"response.created","response":{"id":"resp_live_001","status":"in_progress","model":"gpt-6-luna","service_tier":"default"}}`,
+			``,
+			`event: response.in_progress`,
+			`data: {"type":"response.in_progress","response":{"id":"resp_live_001","status":"in_progress","model":"gpt-6-luna","service_tier":"default"}}`,
+			``,
+			`event: error`,
+			`data: {"type":"error","code":"server_error","message":"secret-upstream-msg"}`,
+			``,
+			``,
+		}, "\n")
+		postFn := func(b []byte, k string) (int, map[string]string, []byte, error) {
+			return 200, map[string]string{"content-type": "text/event-stream"}, []byte(sse), nil
+		}
+		srv, err := responses.NewResponsesBrokerServer(ledger, "sk-test-secret", "diag1", 3, filepath.Join(tmpDir, "sock"), expRoot, fakeGetOK, fakeCountOK, postFn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		reqBytes, _ := json.Marshal(map[string]any{"model": responses.PinnedModel, "stream": true})
+		status, reply := srv.HandleFrameBytes(reqBytes)
+		if status != 502 {
+			t.Fatalf("expected 502, got %d", status)
+		}
+		if strings.Contains(string(reply), "secret-upstream-msg") {
+			t.Fatalf("502 reply leaked upstream error message: %s", string(reply))
+		}
+		var replyObj map[string]any
+		if err := json.Unmarshal(reply, &replyObj); err != nil {
+			t.Fatalf("invalid 502 JSON: %v (%s)", err, string(reply))
+		}
+		if replyObj["error"] != "invalid_upstream_sse" || replyObj["detail"] != "forbidden SSE event: error" || replyObj["upstream_error_code"] != "server_error" {
+			t.Fatalf("unexpected 502 reply payload: %+v", replyObj)
+		}
+
+		st, err := ledger.GetStatus()
+		if err != nil || !st.Halted || st.HaltReason == nil || *st.HaltReason != "INVALID_RECEIPT_EVIDENCE" {
+			t.Fatalf("expected halted ledger with INVALID_RECEIPT_EVIDENCE, got %+v %v", st, err)
+		}
+		if st.RetainedFailedMicros != responses.ReservationFor(1200) {
+			t.Fatalf("expected retained %d, got %d", responses.ReservationFor(1200), st.RetainedFailedMicros)
+		}
+
+		evData, err := os.ReadFile(filepath.Join(expRoot, "live-broker-diag1.jsonl"))
+		if err != nil {
+			t.Fatalf("read evidence: %v", err)
+		}
+		if strings.Contains(string(evData), "secret-upstream-msg") {
+			t.Fatalf("evidence leaked upstream error message: %s", string(evData))
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(strings.Split(strings.TrimSpace(string(evData)), "\n")[0]), &rec); err != nil {
+			t.Fatalf("unmarshal evidence: %v", err)
+		}
+		if rec["response_id"] != "resp_live_001" || rec["model"] != "gpt-6-luna" || rec["service_tier"] != "default" {
+			t.Fatalf("expected response metadata in evidence, got %+v", rec)
+		}
+		if rec["parse_error"] != "forbidden SSE event: error" || rec["upstream_error_code"] != "server_error" {
+			t.Fatalf("expected diagnostic error fields in evidence, got %+v", rec)
+		}
+	})
+
+	t.Run("nested_error_object_extracts_type_and_code", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		expRoot := filepath.Join(tmpDir, "exp")
+		ledger, err := budget.Initialize(filepath.Join(expRoot, "ledger"), budget.DefaultExperimentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ledger.Close()
+
+		sse := "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"secret-prompt-echo\"}}\n\n"
+		postFn := func(b []byte, k string) (int, map[string]string, []byte, error) {
+			return 200, map[string]string{"content-type": "text/event-stream"}, []byte(sse), nil
+		}
+		srv, err := responses.NewResponsesBrokerServer(ledger, "sk-test-secret", "diag2", 3, filepath.Join(tmpDir, "sock"), expRoot, fakeGetOK, fakeCountOK, postFn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		reqBytes, _ := json.Marshal(map[string]any{"model": responses.PinnedModel, "stream": true})
+		status, reply := srv.HandleFrameBytes(reqBytes)
+		if status != 502 {
+			t.Fatalf("expected 502, got %d", status)
+		}
+		if strings.Contains(string(reply), "secret-prompt-echo") {
+			t.Fatalf("502 reply leaked message: %s", string(reply))
+		}
+		var replyObj map[string]any
+		if err := json.Unmarshal(reply, &replyObj); err != nil {
+			t.Fatal(err)
+		}
+		if replyObj["upstream_error_type"] != "rate_limit_error" || replyObj["upstream_error_code"] != "rate_limit_exceeded" {
+			t.Fatalf("expected error type/code in 502 reply, got %+v", replyObj)
+		}
+
+		evData, err := os.ReadFile(filepath.Join(expRoot, "live-broker-diag2.jsonl"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(evData), "secret-prompt-echo") {
+			t.Fatalf("evidence leaked message: %s", string(evData))
+		}
+		var rec map[string]any
+		_ = json.Unmarshal([]byte(strings.Split(strings.TrimSpace(string(evData)), "\n")[0]), &rec)
+		if rec["upstream_error_type"] != "rate_limit_error" || rec["upstream_error_code"] != "rate_limit_exceeded" {
+			t.Fatalf("expected error type/code in evidence, got %+v", rec)
+		}
+	})
+}
+
+func TestResponseFailedExtractsSafeErrorAndDropsUnsafeTokens(t *testing.T) {
+	t.Run("safe_response_failed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		expRoot := filepath.Join(tmpDir, "exp")
+		ledger, err := budget.Initialize(filepath.Join(expRoot, "ledger"), budget.DefaultExperimentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ledger.Close()
+
+		sse := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_fail_1\",\"model\":\"gpt-6-luna\",\"service_tier\":\"default\",\"status\":\"failed\",\"error\":{\"type\":\"server_error\",\"code\":\"internal_error\",\"message\":\"secret-msg\"}}}\n\n"
+		postFn := func(b []byte, k string) (int, map[string]string, []byte, error) {
+			return 200, map[string]string{"content-type": "text/event-stream"}, []byte(sse), nil
+		}
+		srv, err := responses.NewResponsesBrokerServer(ledger, "sk-test", "rf1", 3, filepath.Join(tmpDir, "sock"), expRoot, fakeGetOK, fakeCountOK, postFn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		reqBytes, _ := json.Marshal(map[string]any{"model": responses.PinnedModel, "stream": true})
+		status, reply := srv.HandleFrameBytes(reqBytes)
+		if status != 502 {
+			t.Fatalf("expected 502, got %d", status)
+		}
+		var replyObj map[string]any
+		_ = json.Unmarshal(reply, &replyObj)
+		if replyObj["detail"] != "forbidden SSE event: response.failed" || replyObj["upstream_error_type"] != "server_error" || replyObj["upstream_error_code"] != "internal_error" {
+			t.Fatalf("unexpected 502 reply: %+v", replyObj)
+		}
+		evData, _ := os.ReadFile(filepath.Join(expRoot, "live-broker-rf1.jsonl"))
+		var rec map[string]any
+		_ = json.Unmarshal([]byte(strings.Split(strings.TrimSpace(string(evData)), "\n")[0]), &rec)
+		if rec["response_id"] != "resp_fail_1" || rec["parse_error"] != "forbidden SSE event: response.failed" || rec["upstream_error_type"] != "server_error" || rec["upstream_error_code"] != "internal_error" {
+			t.Fatalf("unexpected evidence record: %+v", rec)
+		}
+		if strings.Contains(string(evData), "secret-msg") || strings.Contains(string(reply), "secret-msg") {
+			t.Fatalf("leaked error message")
+		}
+	})
+
+	t.Run("unsafe_tokens_dropped", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		expRoot := filepath.Join(tmpDir, "exp")
+		ledger, err := budget.Initialize(filepath.Join(expRoot, "ledger"), budget.DefaultExperimentID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ledger.Close()
+
+		sse := "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"bad id\",\"status\":\"failed\",\"error\":{\"type\":\"bad value with spaces\",\"code\":\"prompt leak here\"}}}\n\n"
+		postFn := func(b []byte, k string) (int, map[string]string, []byte, error) {
+			return 200, map[string]string{"content-type": "text/event-stream"}, []byte(sse), nil
+		}
+		srv, err := responses.NewResponsesBrokerServer(ledger, "sk-test", "rf2", 3, filepath.Join(tmpDir, "sock"), expRoot, fakeGetOK, fakeCountOK, postFn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		reqBytes, _ := json.Marshal(map[string]any{"model": responses.PinnedModel, "stream": true})
+		status, reply := srv.HandleFrameBytes(reqBytes)
+		if status != 502 {
+			t.Fatalf("expected 502, got %d", status)
+		}
+		var replyObj map[string]any
+		_ = json.Unmarshal(reply, &replyObj)
+		if replyObj["upstream_error_type"] != "other" {
+			t.Fatalf("expected unrecognized error type mapped to \"other\", got %+v", replyObj)
+		}
+		if replyObj["upstream_error_code"] != "other" {
+			t.Fatalf("expected unrecognized error code mapped to \"other\", got %+v", replyObj)
+		}
+		if strings.Contains(string(reply), "bad value with spaces") || strings.Contains(string(reply), "prompt leak here") {
+			t.Fatalf("leaked unsafe tokens into 502 reply: %s", string(reply))
+		}
+		evData, _ := os.ReadFile(filepath.Join(expRoot, "live-broker-rf2.jsonl"))
+		var rec map[string]any
+		_ = json.Unmarshal([]byte(strings.Split(strings.TrimSpace(string(evData)), "\n")[0]), &rec)
+		if rec["upstream_error_type"] != "other" || rec["upstream_error_code"] != "other" || rec["response_id"] != nil {
+			t.Fatalf("expected allowlisted/\"other\" diagnostic fields and nil response_id in evidence, got %+v", rec)
+		}
+		if strings.Contains(string(evData), "bad value with spaces") || strings.Contains(string(evData), "prompt leak here") || strings.Contains(string(evData), "bad id") {
+			t.Fatalf("leaked unsafe tokens into evidence: %s", string(evData))
+		}
+	})
+}
+
+func TestSSEDiagnosticsNeverReflectCredentialsOrArbitraryTokens(t *testing.T) {
+	fakeKeys := []struct {
+		name    string
+		fakeKey string
+		sse     string
+	}{
+		{
+			name:    "sk_key_in_error_code_and_type",
+			fakeKey: "sk-review-fixture-0123456789abcdef",
+			sse:     `event: error` + "\n" + `data: {"type":"error","error_type":"sk-review-fixture-0123456789abcdef","code":"sk-review-fixture-0123456789abcdef","message":"must-not-be-read"}` + "\n\n",
+		},
+		{
+			name:    "sess_key_in_response_id_and_model_and_tier",
+			fakeKey: "sess-secret-0123456789abcdef",
+			sse:     `event: response.failed` + "\n" + `data: {"type":"response.failed","response":{"id":"sess-secret-0123456789abcdef","model":"sess-secret-0123456789abcdef","service_tier":"sess-secret-0123456789abcdef","status":"failed","error":{"type":"sess-secret-0123456789abcdef","code":"sess-secret-0123456789abcdef"}}}` + "\n\n",
+		},
+		{
+			name:    "resp_prefixed_configured_key_in_response_id",
+			fakeKey: "resp_secret_key_0123456789",
+			sse:     `event: error` + "\n" + `data: {"type":"error","response":{"id":"resp_secret_key_0123456789","model":"resp_secret_key_0123456789","service_tier":"resp_secret_key_0123456789"},"code":"resp_secret_key_0123456789"}` + "\n\n",
+		},
+		{
+			name:    "completed_mismatch_with_secret_model_tier_status",
+			fakeKey: "sk-mismatch-secret-987654",
+			sse:     string(makeSSEStream("sk-mismatch-secret-987654", "sk-mismatch-secret-987654", "sk-mismatch-secret-987654", "sk-mismatch-secret-987654", 10, 5, 15, "ok", true, nil, nil)),
+		},
+	}
+
+	for _, tc := range fakeKeys {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			expRoot := filepath.Join(tmpDir, "exp")
+			ledger, err := budget.Initialize(filepath.Join(expRoot, "ledger"), budget.DefaultExperimentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ledger.Close()
+
+			postFn := func(b []byte, k string) (int, map[string]string, []byte, error) {
+				return 200, map[string]string{"content-type": "text/event-stream"}, []byte(tc.sse), nil
+			}
+			srv, err := responses.NewResponsesBrokerServer(ledger, tc.fakeKey, "secretcheck", 3, filepath.Join(tmpDir, "sock"), expRoot, fakeGetOK, fakeCountOK, postFn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer srv.Close()
+
+			origStderr := os.Stderr
+			rPipe, wPipe, err := os.Pipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			os.Stderr = wPipe
+
+			reqBytes, _ := json.Marshal(map[string]any{"model": responses.PinnedModel, "stream": true})
+			status, reply := srv.HandleFrameBytes(reqBytes)
+
+			_ = wPipe.Close()
+			os.Stderr = origStderr
+			stderrBytes, _ := io.ReadAll(rPipe)
+			_ = rPipe.Close()
+
+			if status != 502 {
+				t.Fatalf("expected 502, got %d", status)
+			}
+			evData, err := os.ReadFile(filepath.Join(expRoot, "live-broker-secretcheck.jsonl"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(string(reply), tc.fakeKey) {
+				t.Fatalf("502 reply exposed secret %q: %s", tc.fakeKey, string(reply))
+			}
+			if strings.Contains(string(evData), tc.fakeKey) {
+				t.Fatalf("evidence JSONL exposed secret %q: %s", tc.fakeKey, string(evData))
+			}
+			if strings.Contains(string(stderrBytes), tc.fakeKey) {
+				t.Fatalf("stderr exposed secret %q: %s", tc.fakeKey, string(stderrBytes))
+			}
+			if strings.Contains(string(reply), "must-not-be-read") || strings.Contains(string(evData), "must-not-be-read") {
+				t.Fatalf("raw message leaked")
+			}
+			st, err := ledger.GetStatus()
+			if err != nil || !st.Halted || st.HaltReason == nil || *st.HaltReason != "INVALID_RECEIPT_EVIDENCE" {
+				t.Fatalf("expected fail-closed ledger halt, got %+v err=%v", st, err)
+			}
+		})
+	}
+}
+
+func TestRunResponsesBrokerExperimentRootEnforcesMigrationGuard(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GUARDFIL_OWNER_SOCKET", "")
+	t.Setenv("GUARDFIL_SESSION_ID", "")
+
+	credDir := filepath.Join(home, ".config/guardfil/credentials.d")
+	if err := os.MkdirAll(credDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credDir, "openai-api-key"), []byte("sk-fake-test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := budget.ProviderLedgerSpecs["openai"]
+	stateRoot := filepath.Join(home, ".local/state/guardfil")
+	legacyRoot := filepath.Join(stateRoot, spec.LegacyDir)
+	if err := os.MkdirAll(legacyRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	l, err := budget.Initialize(filepath.Join(legacyRoot, "ledger"), spec.LegacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+
+	targetRoot := filepath.Join(stateRoot, spec.TargetDir)
+	err = responses.RunResponsesBroker(filepath.Join(t.TempDir(), "sock"), "exptarget", 2, targetRoot, true, "")
+	if !errors.Is(err, budget.ErrLedgerMigrationRequired) {
+		t.Fatalf("expected ErrLedgerMigrationRequired for --experiment-root %s, got %v", targetRoot, err)
+	}
+	if _, statErr := os.Stat(targetRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("target dir %s was created despite unmigrated legacy", targetRoot)
+	}
+
+	err = responses.RunResponsesBroker(filepath.Join(t.TempDir(), "sock"), "explegacy", 2, legacyRoot, true, "")
+	if !errors.Is(err, budget.ErrLedgerMigrationRequired) {
+		t.Fatalf("expected ErrLedgerMigrationRequired for --experiment-root %s, got %v", legacyRoot, err)
+	}
+	if _, statErr := os.Stat(targetRoot); !os.IsNotExist(statErr) {
+		t.Fatalf("target dir %s was created via legacy --experiment-root", targetRoot)
+	}
+}
+
+func TestRunResponsesBrokerRefusesUnmigratedLegacy(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GUARDFIL_OWNER_SOCKET", "")
+	t.Setenv("GUARDFIL_SESSION_ID", "")
+
+	credDir := filepath.Join(home, ".config/guardfil/credentials.d")
+	if err := os.MkdirAll(credDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(credDir, "openai-api-key"), []byte("sk-fake-test\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := budget.ProviderLedgerSpecs["openai"]
+	legacyRoot := filepath.Join(home, ".local/state/guardfil", spec.LegacyDir)
+	if err := os.MkdirAll(legacyRoot, 0700); err != nil {
+		t.Fatal(err)
+	}
+	l, err := budget.Initialize(filepath.Join(legacyRoot, "ledger"), spec.LegacyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+
+	err = responses.RunResponsesBroker(filepath.Join(t.TempDir(), "sock"), "legacyrefuse", 2, "", true, "")
+	if !errors.Is(err, budget.ErrLedgerMigrationRequired) {
+		t.Fatalf("expected ErrLedgerMigrationRequired, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(home, ".local/state/guardfil", spec.TargetDir)); !os.IsNotExist(statErr) {
+		t.Fatalf("target dir created despite unmigrated legacy")
 	}
 }

@@ -95,16 +95,20 @@ When the $2.00 ceiling or the ledger's 256-request cap is reached, the broker re
 | `COST_EXCEEDS_RESERVATION` | A reply cost more than the amount reserved for it. The ledger halts (a halt reason, not a per-call block) and refuses further requests. | Should not happen with the pinned models. Report it; don't edit the ledger by hand. |
 | `MAX_REQUESTS_EXCEEDED` | The session reached its `--max-requests` cap. | Start a new session or raise `--max-requests` (Codex: 1–64). |
 | `RESERVE_FAILED` | Broker could not reserve budget in the ledger (lease busy or lock failure). | Check for dangling broker processes on the host. |
+| `legacy ledger migration required` | An unmigrated legacy ledger directory (`t2a-experiment`, `anthropic-experiment`, or `gemini-experiment-6`) exists under `~/.local/state/guardfil/`. The broker refuses to open a fresh ledger automatically. | Run `$GF_HOME/bin/guardfil-broker migrate-ledger --provider all --dry-run` and then `migrate-ledger --provider all`. |
+| `ledger migration state invalid` | A retired legacy `ledger/` directory, `migrated_to.json`, `ledger.json.pre-migration-backup`, or target provenance check failed or is incomplete. Never delete retired legacy directories or move `ledger.json.pre-migration-backup` back to `ledger.json`. | Inspect `$HOME/.local/state/guardfil/` with `guardfil-broker migrate-ledger --provider all --dry-run`; do not edit or restore ledger files by hand. |
+| `atomic target directory publish failed` | `renameat2(..., RENAME_NOREPLACE)` was rejected or unsupported (`EINVAL`) by the underlying filesystem when publishing the migrated ledger directory. | Keep `~/.local/state/guardfil/` on a local Linux filesystem (such as ext4 or xfs) that supports `RENAME_NOREPLACE`, rather than an unsupported NFS or overlay mount. |
 | `DECISION_LOG_UNAVAILABLE`| GuardFil failed to append to `$GF_HOME/state/decisions.jsonl`. | Check disk space (`df -h`) and file permissions on `$GF_HOME/state`. |
 
 ---
 
-## 9. Workspace Startup Errors
+## 9. Workspace and Local Startup Errors
 
-These are launcher messages, not reason codes. The agent does not start; GuardFil never falls back to mounting the raw folder.
+These are launcher messages and startup errors, not reason codes. The agent does not start; GuardFil never falls back to mounting the raw folder.
 
 | Message | Explanation | Resolution |
 | --- | --- | --- |
 | `workspace mediation needs /dev/fuse and fusermount3` | FUSE 3 is not installed or `/dev/fuse` is not accessible. | Install FUSE 3 (Debian/Ubuntu: `sudo apt-get install fuse3`). |
 | `workspace mediation needs user_allow_other in /etc/fuse.conf` | Docker cannot bind a user's FUSE mount without this host-wide option. | An administrator runs `echo user_allow_other \| sudo tee -a /etc/fuse.conf` once. Verify with `guardfil-local.sh check`. |
 | `guardfil-workspace is missing` | The helper binary was not extracted, usually after updating GuardFil. | Run `guardfil-local.sh up`. |
+| `lookup proxy.golang.org ... i/o timeout` (during `guardfil-local.sh up`) | Docker's default bridge subnet (`172.17.0.0/16`) can overlap the host network or upstream DNS resolver, blocking module downloads during `docker compose build`. | From the repository root, pre-build the image on the host network (`docker build --network=host -t guardfil-local:dev -f deployments/Dockerfile .`) and then start with `deployments/local/guardfil-local.sh up --no-build`. |

@@ -46,7 +46,61 @@ const (
 )
 
 var (
-	caseLabelRegex = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	caseLabelRegex       = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+	safeDiagResponseIDRe = regexp.MustCompile(`^resp[_-][A-Za-z0-9_-]{1,96}$`)
+
+	allowedUpstreamErrorTypes = map[string]bool{
+		"invalid_request_error": true,
+		"authentication_error":  true,
+		"permission_error":      true,
+		"not_found_error":       true,
+		"rate_limit_error":      true,
+		"server_error":          true,
+		"api_error":             true,
+		"overloaded_error":      true,
+		"timeout_error":         true,
+		"tokens":                true,
+		"requests":              true,
+		"insufficient_quota":    true,
+		"billing_error":         true,
+		"content_filter":        true,
+	}
+
+	allowedUpstreamErrorCodes = map[string]bool{
+		"server_error":                true,
+		"internal_error":              true,
+		"rate_limit_exceeded":         true,
+		"insufficient_quota":          true,
+		"invalid_api_key":             true,
+		"model_not_found":             true,
+		"context_length_exceeded":     true,
+		"max_tokens":                  true,
+		"invalid_request_error":       true,
+		"invalid_value":               true,
+		"missing_required_parameter":  true,
+		"unsupported_parameter":       true,
+		"content_policy_violation":    true,
+		"content_filter":              true,
+		"service_unavailable":         true,
+		"timeout":                     true,
+		"stream_error":                true,
+		"response_failed":             true,
+		"vector_store_timeout":        true,
+		"image_parse_error":           true,
+		"previous_response_not_found": true,
+		"billing_hard_limit_reached":  true,
+		"account_deactivated":         true,
+		"invalid_encrypted_content":   true,
+	}
+
+	allowedServiceTiers = map[string]bool{
+		"default":  true,
+		"standard": true,
+		"auto":     true,
+		"flex":     true,
+		"priority": true,
+		"scale":    true,
+	}
 
 	forbiddenHostedToolExact = map[string]bool{
 		"file_search": true, "code_interpreter": true, "image_generation": true, "mcp": true,
@@ -571,6 +625,119 @@ type ParsedSSEMetadata struct {
 	TotalTokens  int
 }
 
+type SSEDiagnostic struct {
+	ResponseID  string
+	Model       string
+	ServiceTier string
+	ErrorType   string
+	ErrorCode   string
+}
+
+func containsSecretShape(s string) bool {
+	return strings.Contains(s, "sk-") || strings.Contains(s, "sess-")
+}
+
+func safeDiagErrorType(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	if allowedUpstreamErrorTypes[trimmed] {
+		return trimmed
+	}
+	return "other"
+}
+
+func safeDiagErrorCode(v any) string {
+	s, ok := v.(string)
+	if !ok {
+		return ""
+	}
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	if allowedUpstreamErrorCodes[trimmed] {
+		return trimmed
+	}
+	return "other"
+}
+
+func safeDiagID(v any) string {
+	s, ok := v.(string)
+	if !ok || !safeDiagResponseIDRe.MatchString(s) || containsSecretShape(s) {
+		return ""
+	}
+	return s
+}
+
+func safeDiagModel(v any, requestedModel string) string {
+	s, ok := v.(string)
+	if !ok || s == "" || containsSecretShape(s) {
+		return ""
+	}
+	if s == requestedModel {
+		return s
+	}
+	if _, known := budget.ModelRates[s]; known {
+		return s
+	}
+	return ""
+}
+
+func safeDiagServiceTier(v any) string {
+	s, ok := v.(string)
+	if !ok || !allowedServiceTiers[s] {
+		return ""
+	}
+	return s
+}
+
+func scrubDiagSecret(val string, secret string) string {
+	if val == "" {
+		return ""
+	}
+	if containsSecretShape(val) {
+		return ""
+	}
+	if secret != "" && strings.Contains(val, secret) {
+		return ""
+	}
+	return val
+}
+
+func extractSafeSSEError(dataObj map[string]any) (errType string, errCode string) {
+	if t := safeDiagErrorType(dataObj["error_type"]); t != "" {
+		errType = t
+	}
+	if c := safeDiagErrorCode(dataObj["code"]); c != "" {
+		errCode = c
+	}
+	if errObj, ok := dataObj["error"].(map[string]any); ok && errObj != nil {
+		if errType == "" {
+			errType = safeDiagErrorType(errObj["type"])
+		}
+		if errCode == "" {
+			errCode = safeDiagErrorCode(errObj["code"])
+		}
+	}
+	if respObj, ok := dataObj["response"].(map[string]any); ok && respObj != nil {
+		if errObj, ok := respObj["error"].(map[string]any); ok && errObj != nil {
+			if errType == "" {
+				errType = safeDiagErrorType(errObj["type"])
+			}
+			if errCode == "" {
+				errCode = safeDiagErrorCode(errObj["code"])
+			}
+		}
+	}
+	return errType, errCode
+}
+
 // UnbilledStatuses are provider statuses for a request that was refused or
 // failed before it was processed, and is not billed: they settle at zero.
 var UnbilledStatuses = map[int]bool{400: true, 401: true, 403: true, 404: true, 413: true, 422: true,
@@ -583,21 +750,30 @@ func ParseAndValidateSSE(httpStatus int, headers map[string]string, rawBody []by
 // ParseAndValidateSSEFor is ParseAndValidateSSE for a requested model; the
 // reply must name exactly that model (list the provider's exact model id).
 func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]string, rawBody []byte, outboundMaxOutputTokens int) (bool, *ParsedSSEMetadata, map[string]int, string) {
+	ok, meta, counts, reason, _ := ParseAndValidateSSEDetailed(model, httpStatus, headers, rawBody, outboundMaxOutputTokens)
+	return ok, meta, counts, reason
+}
+
+// ParseAndValidateSSEDetailed parses and validates an OpenAI Responses SSE
+// stream while capturing bounded, secret-free response and upstream error
+// diagnostic metadata for fail-closed failures.
+func ParseAndValidateSSEDetailed(model string, httpStatus int, headers map[string]string, rawBody []byte, outboundMaxOutputTokens int) (bool, *ParsedSSEMetadata, map[string]int, string, *SSEDiagnostic) {
 	counts := make(map[string]int)
+	diag := &SSEDiagnostic{}
 	if httpStatus != 200 {
-		return false, nil, counts, fmt.Sprintf("expected HTTP 200, got %d", httpStatus)
+		return false, nil, counts, fmt.Sprintf("expected HTTP 200, got %d", httpStatus), diag
 	}
 	if len(rawBody) > MaxStreamResponseBytes {
-		return false, nil, counts, "SSE body exceeds 16 MiB limit"
+		return false, nil, counts, "SSE body exceeds 16 MiB limit", diag
 	}
 
 	text := string(rawBody)
 	normalized := strings.ReplaceAll(text, "\r\n", "\n")
 	if strings.Contains(normalized, "\r") {
-		return false, nil, counts, "lone CR in SSE stream"
+		return false, nil, counts, "lone CR in SSE stream", diag
 	}
 	if strings.TrimSpace(normalized) == "" {
-		return false, nil, counts, "empty SSE stream"
+		return false, nil, counts, "empty SSE stream", diag
 	}
 
 	blocks := strings.Split(normalized, "\n\n")
@@ -611,7 +787,7 @@ func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]str
 			continue
 		}
 		if sawDone {
-			return false, nil, counts, "trailing data after [DONE]"
+			return false, nil, counts, "trailing data after [DONE]", diag
 		}
 
 		lines := strings.Split(block, "\n")
@@ -624,42 +800,42 @@ func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]str
 			}
 			if strings.HasPrefix(line, ":") {
 				if sawCompleted {
-					return false, nil, counts, "comment after terminal event"
+					return false, nil, counts, "comment after terminal event", diag
 				}
 				continue
 			}
 			if strings.HasPrefix(line, "event:") {
 				if eventHeader != "" {
-					return false, nil, counts, "duplicate event: line in SSE block"
+					return false, nil, counts, "duplicate event: line in SSE block", diag
 				}
 				eventHeader = strings.TrimSpace(line[len("event:"):])
 				if eventHeader == "" {
-					return false, nil, counts, "empty event: header in SSE block"
+					return false, nil, counts, "empty event: header in SSE block", diag
 				}
 			} else if strings.HasPrefix(line, "data:") {
 				dataLines = append(dataLines, strings.TrimSpace(line[len("data:"):]))
 			} else {
-				return false, nil, counts, "malformed line in SSE block"
+				return false, nil, counts, "malformed line in SSE block", diag
 			}
 		}
 
 		if len(dataLines) == 0 {
 			if eventHeader != "" {
-				return false, nil, counts, "event header without data line"
+				return false, nil, counts, "event header without data line", diag
 			}
 			continue
 		}
 		if len(dataLines) != 1 {
-			return false, nil, counts, "multiple data lines in single SSE event"
+			return false, nil, counts, "multiple data lines in single SSE event", diag
 		}
 
 		dataStr := dataLines[0]
 		if dataStr == "[DONE]" {
 			if !sawCompleted {
-				return false, nil, counts, "[DONE] before response.completed"
+				return false, nil, counts, "[DONE] before response.completed", diag
 			}
 			if eventHeader != "" && eventHeader != "done" {
-				return false, nil, counts, "unexpected event header on [DONE]"
+				return false, nil, counts, "unexpected event header on [DONE]", diag
 			}
 			sawDone = true
 			continue
@@ -667,23 +843,42 @@ func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]str
 
 		var dataObj map[string]any
 		if err := json.Unmarshal([]byte(dataStr), &dataObj); err != nil {
-			return false, nil, counts, "malformed JSON in SSE data"
+			return false, nil, counts, "malformed JSON in SSE data", diag
 		}
 
 		evType, _ := dataObj["type"].(string)
 		if evType == "" {
-			return false, nil, counts, "SSE JSON object missing string type"
+			return false, nil, counts, "SSE JSON object missing string type", diag
 		}
 		if eventHeader != "" && eventHeader != evType {
-			return false, nil, counts, "SSE event header does not match data.type"
+			return false, nil, counts, "SSE event header does not match data.type", diag
+		}
+
+		if respObj, ok := dataObj["response"].(map[string]any); ok && respObj != nil {
+			if diag.ResponseID == "" {
+				diag.ResponseID = safeDiagID(respObj["id"])
+			}
+			if diag.Model == "" {
+				diag.Model = safeDiagModel(respObj["model"], model)
+			}
+			if diag.ServiceTier == "" {
+				diag.ServiceTier = safeDiagServiceTier(respObj["service_tier"])
+			}
 		}
 
 		counts[evType]++
 		if forbiddenSSEEvents[evType] {
-			return false, nil, counts, fmt.Sprintf("forbidden SSE event: %s", evType)
+			errType, errCode := extractSafeSSEError(dataObj)
+			if diag.ErrorType == "" {
+				diag.ErrorType = errType
+			}
+			if diag.ErrorCode == "" {
+				diag.ErrorCode = errCode
+			}
+			return false, nil, counts, fmt.Sprintf("forbidden SSE event: %s", evType), diag
 		}
 		if sawCompleted {
-			return false, nil, counts, "trailing event after response.completed"
+			return false, nil, counts, "trailing event after response.completed", diag
 		}
 
 		// A response cut off at max_output_tokens ends with response.incomplete;
@@ -693,17 +888,17 @@ func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]str
 			terminalType = evType
 			respObj, ok := dataObj["response"].(map[string]any)
 			if !ok || respObj == nil {
-				return false, nil, counts, evType + " missing response object"
+				return false, nil, counts, evType + " missing response object", diag
 			}
 			completedResp = respObj
 		}
 	}
 
 	if !sawCompleted || completedResp == nil {
-		return false, nil, counts, "missing response.completed event"
+		return false, nil, counts, "missing response.completed event", diag
 	}
 	if counts["response.completed"]+counts["response.incomplete"] != 1 {
-		return false, nil, counts, "expected exactly one terminal response event"
+		return false, nil, counts, "expected exactly one terminal response event", diag
 	}
 
 	respID, _ := completedResp["id"].(string)
@@ -712,47 +907,49 @@ func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]str
 	statusVal, _ := completedResp["status"].(string)
 
 	if completedResp["error"] != nil {
-		return false, nil, counts, "terminal response has non-null error"
+		errType, errCode := extractSafeSSEError(map[string]any{"response": completedResp})
+		diag.ErrorType, diag.ErrorCode = errType, errCode
+		return false, nil, counts, "terminal response has non-null error", diag
 	}
 	if terminalType == "response.incomplete" {
 		details, _ := completedResp["incomplete_details"].(map[string]any)
 		if statusVal != "incomplete" || details == nil || details["reason"] != "max_output_tokens" {
-			return false, nil, counts, "incomplete response is not a max_output_tokens cut-off"
+			return false, nil, counts, "incomplete response is not a max_output_tokens cut-off", diag
 		}
 	} else {
 		if statusVal != "completed" {
-			return false, nil, counts, fmt.Sprintf("expected status=='completed', got %q", statusVal)
+			return false, nil, counts, "expected status=='completed', got unexpected status", diag
 		}
 		if completedResp["incomplete_details"] != nil {
-			return false, nil, counts, "completed response has non-null incomplete_details"
+			return false, nil, counts, "completed response has non-null incomplete_details", diag
 		}
 	}
 	if respID == "" {
-		return false, nil, counts, "invalid response_id"
+		return false, nil, counts, "invalid response_id", diag
 	}
 	if modelVal != model {
-		return false, nil, counts, fmt.Sprintf("model mismatch: %q", modelVal)
+		return false, nil, counts, "model mismatch", diag
 	}
 	if tierVal != PinnedServiceTier {
-		return false, nil, counts, fmt.Sprintf("service_tier mismatch: %q", tierVal)
+		return false, nil, counts, "service_tier mismatch", diag
 	}
 
 	usage, ok := completedResp["usage"].(map[string]any)
 	if !ok || usage == nil {
-		return false, nil, counts, "missing or non-object usage"
+		return false, nil, counts, "missing or non-object usage", diag
 	}
 	inTok, inOk := parseStrictInt(usage["input_tokens"])
 	outTok, outOk := parseStrictInt(usage["output_tokens"])
 	totTok, totOk := parseStrictInt(usage["total_tokens"])
 
 	if !inOk || !outOk || !totOk || inTok < 0 || outTok < 0 || totTok < 0 || totTok != inTok+outTok {
-		return false, nil, counts, "invalid or inconsistent token counts"
+		return false, nil, counts, "invalid or inconsistent token counts", diag
 	}
 	if outTok > outboundMaxOutputTokens || outTok > budget.MaxOutputTokens {
-		return false, nil, counts, "output_tokens exceeds bound"
+		return false, nil, counts, "output_tokens exceeds bound", diag
 	}
 	if inTok > budget.MaxInputTokens {
-		return false, nil, counts, "input_tokens exceeds bound"
+		return false, nil, counts, "input_tokens exceeds bound", diag
 	}
 
 	meta := &ParsedSSEMetadata{
@@ -763,7 +960,7 @@ func ParseAndValidateSSEFor(model string, httpStatus int, headers map[string]str
 		OutputTokens: outTok,
 		TotalTokens:  totTok,
 	}
-	return true, meta, counts, ""
+	return true, meta, counts, "", diag
 }
 
 type ResponsesBrokerServer struct {
@@ -898,6 +1095,9 @@ func (s *ResponsesBrokerServer) writeEvidence(
 	eventTypeCounts map[string]int,
 	outcomeCode string,
 	startUTC string,
+	parseError *string,
+	upstreamErrorType *string,
+	upstreamErrorCode *string,
 ) {
 	if s.experimentRoot == "" {
 		return
@@ -953,6 +1153,9 @@ func (s *ResponsesBrokerServer) writeEvidence(
 		"response_body_sha256": responseBodySHA256,
 		"event_type_counts":    eventTypeCounts,
 		"outcome_code":         outcomeCode,
+		"parse_error":          parseError,
+		"upstream_error_type":  upstreamErrorType,
+		"upstream_error_code":  upstreamErrorCode,
 		"ledger_status":        ledgerStatusMap,
 		"timestamps": map[string]string{
 			"started_at_utc":   startUTC,
@@ -979,17 +1182,17 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 	startUTC := time.Now().UTC().Format("2006-01-02T15:04:05.000000+00:00")
 
 	if s.count >= s.maxRequests {
-		s.writeEvidence(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "MAX_REQUESTS_EXCEEDED", startUTC)
+		s.writeEvidence(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, "MAX_REQUESTS_EXCEEDED", startUTC, nil, nil, nil)
 		return 429, []byte(`{"error":"max_requests_exceeded"}`)
 	}
 
 	val := ValidateAndPrepareRequest(rawBody)
 	if val.ErrorReason != "" {
-		s.writeEvidence(nil, nil, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "REFUSED_PRE_RESERVE", startUTC)
+		s.writeEvidence(nil, nil, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "REFUSED_PRE_RESERVE", startUTC, nil, nil, nil)
 		return 400, []byte(`{"error":"request_refused_by_broker"}`)
 	}
 	if err := s.CloudGuard.Check(); err != nil {
-		s.writeEvidence(nil, &val.Digest, nil, nil, nil, nil, nil, nil, nil, nil, nil, "CLOUD_REQUEST_BLOCKED", startUTC)
+		s.writeEvidence(nil, &val.Digest, nil, nil, nil, nil, nil, nil, nil, nil, nil, "CLOUD_REQUEST_BLOCKED", startUTC, nil, nil, nil)
 		return http.StatusForbidden, egress.ErrorBody(err)
 	}
 
@@ -999,7 +1202,7 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 		if pfStatus > 0 {
 			statusPtr = &pfStatus
 		}
-		s.writeEvidence(nil, &val.Digest, val.InsertedFields, val.ToolTypeNames, statusPtr, nil, nil, nil, nil, nil, nil, pfCode, startUTC)
+		s.writeEvidence(nil, &val.Digest, val.InsertedFields, val.ToolTypeNames, statusPtr, nil, nil, nil, nil, nil, nil, pfCode, startUTC, nil, nil, nil)
 		return 400, []byte(fmt.Sprintf(`{"error":"request_refused_by_preflight","code":%q}`, pfCode))
 	}
 
@@ -1008,14 +1211,14 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 	amount, fits := ReservationForModel(val.Model, pfTokens)
 	if !fits {
 		s.count--
-		s.writeEvidence(nil, &val.Digest, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "REFUSED_RESERVATION_TOO_LARGE", startUTC)
+		s.writeEvidence(nil, &val.Digest, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "REFUSED_RESERVATION_TOO_LARGE", startUTC, nil, nil, nil)
 		return 400, []byte(`{"error":"request_refused_by_broker","code":"could cost more than one reservation may hold; shorten the input"}`)
 	}
 
 	permit, err := s.ledger.Reserve(requestID, val.Digest, amount)
 	if err != nil {
 		s.stopRequested = true
-		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "RESERVE_FAILED", startUTC)
+		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "RESERVE_FAILED", startUTC, nil, nil, nil)
 		return 502, []byte(`{"error":"ledger_reserve_failed"}`)
 	}
 
@@ -1023,7 +1226,7 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 	if err != nil {
 		_, _ = s.ledger.RecordFailure(permit, "REQUEST_TRANSPORT_FAILURE")
 		s.stopRequested = true
-		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "REQUEST_TRANSPORT_FAILURE", startUTC)
+		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, nil, nil, nil, nil, nil, nil, nil, "REQUEST_TRANSPORT_FAILURE", startUTC, nil, nil, nil)
 		return 502, []byte(`{"error":"upstream_transport_failure"}`)
 	}
 
@@ -1042,10 +1245,10 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 		st := status
 		if _, err := s.ledger.Settle(permit, zero); err != nil {
 			s.stopRequested = true
-			s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &st, nil, nil, nil, nil, nil, nil, "UNBILLED_SETTLE_FAILED", startUTC)
+			s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &st, nil, nil, nil, nil, nil, nil, "UNBILLED_SETTLE_FAILED", startUTC, nil, nil, nil)
 			return 502, []byte(`{"error":"ledger_settlement_failed"}`)
 		}
-		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &st, nil, nil, nil, nil, nil, nil, "UNBILLED_STATUS", startUTC)
+		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &st, nil, nil, nil, nil, nil, nil, "UNBILLED_STATUS", startUTC, nil, nil, nil)
 		if len(respBytes) > 64<<10 {
 			respBytes = respBytes[:64<<10]
 		}
@@ -1059,18 +1262,73 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 		respSHA256 = &str
 	}
 
-	isValid, meta, counts, _ := ParseAndValidateSSEFor(val.Model, status, headers, respBytes, val.OutboundMaxOutputTokens)
+	isValid, meta, counts, parseReason, diag := ParseAndValidateSSEDetailed(val.Model, status, headers, respBytes, val.OutboundMaxOutputTokens)
 	if !isValid || meta == nil {
 		_, _ = s.ledger.RecordFailure(permit, "INVALID_RECEIPT_EVIDENCE")
 		s.stopRequested = true
 		var respID, modelVal, tierVal *string
 		if meta != nil {
-			respID = &meta.ResponseID
-			modelVal = &meta.Model
-			tierVal = &meta.ServiceTier
+			if v := scrubDiagSecret(meta.ResponseID, s.key); v != "" {
+				respID = &v
+			}
+			if v := scrubDiagSecret(meta.Model, s.key); v != "" {
+				modelVal = &v
+			}
+			if v := scrubDiagSecret(meta.ServiceTier, s.key); v != "" {
+				tierVal = &v
+			}
+		} else if diag != nil {
+			if v := scrubDiagSecret(diag.ResponseID, s.key); v != "" {
+				respID = &v
+			}
+			if v := scrubDiagSecret(diag.Model, s.key); v != "" {
+				modelVal = &v
+			}
+			if v := scrubDiagSecret(diag.ServiceTier, s.key); v != "" {
+				tierVal = &v
+			}
 		}
-		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, respID, modelVal, tierVal, nil, respSHA256, counts, "INVALID_RECEIPT_EVIDENCE", startUTC)
-		return 502, []byte(`{"error":"invalid_upstream_sse"}`)
+		safeReason := parseReason
+		if safeReason != "" && scrubDiagSecret(safeReason, s.key) == "" {
+			safeReason = "invalid_upstream_sse"
+		}
+		var parseErrPtr, errTypePtr, errCodePtr *string
+		if safeReason != "" {
+			v := safeReason
+			parseErrPtr = &v
+		}
+		var errTypeStr, errCodeStr, respIDStr string
+		if diag != nil {
+			errTypeStr = scrubDiagSecret(diag.ErrorType, s.key)
+			errCodeStr = scrubDiagSecret(diag.ErrorCode, s.key)
+			respIDStr = scrubDiagSecret(diag.ResponseID, s.key)
+			if errTypeStr != "" {
+				v := errTypeStr
+				errTypePtr = &v
+			}
+			if errCodeStr != "" {
+				v := errCodeStr
+				errCodePtr = &v
+			}
+		}
+		if respID != nil {
+			respIDStr = *respID
+		}
+		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, respID, modelVal, tierVal, nil, respSHA256, counts, "INVALID_RECEIPT_EVIDENCE", startUTC, parseErrPtr, errTypePtr, errCodePtr)
+		fmt.Fprintf(os.Stderr, "guardfil-broker responses: request=%s outcome=INVALID_RECEIPT_EVIDENCE parse_error=%q upstream_error_type=%q upstream_error_code=%q response_id=%q\n",
+			requestID, safeReason, errTypeStr, errCodeStr, respIDStr)
+		errReply := map[string]any{"error": "invalid_upstream_sse"}
+		if safeReason != "" {
+			errReply["detail"] = safeReason
+		}
+		if errTypeStr != "" {
+			errReply["upstream_error_type"] = errTypeStr
+		}
+		if errCodeStr != "" {
+			errReply["upstream_error_code"] = errCodeStr
+		}
+		replyJSON, _ := json.Marshal(errReply)
+		return 502, replyJSON
 	}
 
 	receipt := &budget.Receipt{
@@ -1094,18 +1352,18 @@ func (s *ResponsesBrokerServer) HandleFrameBytes(rawBody []byte) (int, []byte) {
 	if _, err := s.ledger.Settle(permit, receipt); err != nil {
 		_, _ = s.ledger.RecordFailure(permit, "INVALID_RECEIPT_EVIDENCE")
 		s.stopRequested = true
-		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, &meta.ResponseID, &meta.Model, &meta.ServiceTier, usageMap, respSHA256, counts, "INVALID_RECEIPT_EVIDENCE", startUTC)
+		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, &meta.ResponseID, &meta.Model, &meta.ServiceTier, usageMap, respSHA256, counts, "INVALID_RECEIPT_EVIDENCE", startUTC, nil, nil, nil)
 		return 502, []byte(`{"error":"ledger_settlement_failed"}`)
 	}
 
 	st, _ := s.ledger.GetStatus()
 	if st != nil && st.HandleDisabled {
 		s.stopRequested = true
-		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, &meta.ResponseID, &meta.Model, &meta.ServiceTier, usageMap, respSHA256, counts, "SETTLEMENT_COMMITTED_HANDLE_DISABLED", startUTC)
+		s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, &meta.ResponseID, &meta.Model, &meta.ServiceTier, usageMap, respSHA256, counts, "SETTLEMENT_COMMITTED_HANDLE_DISABLED", startUTC, nil, nil, nil)
 		return 502, []byte(`{"error":"settlement_handle_disabled"}`)
 	}
 
-	s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, &meta.ResponseID, &meta.Model, &meta.ServiceTier, usageMap, respSHA256, counts, "SUCCESS", startUTC)
+	s.writeEvidence(&requestID, &val.Digest, val.InsertedFields, val.ToolTypeNames, &status, &meta.ResponseID, &meta.Model, &meta.ServiceTier, usageMap, respSHA256, counts, "SUCCESS", startUTC, nil, nil, nil)
 	return 200, respBytes
 }
 
@@ -1196,13 +1454,33 @@ func (s *ResponsesBrokerServer) Close() {
 	}
 }
 
+func canonicalPathForGuard(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	dir := filepath.Dir(abs)
+	if resolvedDir, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Clean(filepath.Join(resolvedDir, filepath.Base(abs)))
+	}
+	return filepath.Clean(abs)
+}
+
+func isPathEqualOrUnder(candidate, base string) bool {
+	if candidate == base {
+		return true
+	}
+	sep := string(os.PathSeparator)
+	return strings.HasPrefix(candidate, strings.TrimSuffix(base, sep)+sep)
+}
+
 func RunResponsesBroker(sockdir string, caseLabel string, maxRequests int, expRoot string, initLedger bool, keyFile string) error {
 	guard, err := egress.FromEnv()
 	if err != nil {
 		return err
-	}
-	if expRoot == "" {
-		expRoot = filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/t2a-experiment")
 	}
 	if keyFile == "" {
 		keyFile = filepath.Join(os.Getenv("HOME"), ".config/guardfil/credentials.d/openai-api-key")
@@ -1214,9 +1492,55 @@ func RunResponsesBroker(sockdir string, caseLabel string, maxRequests int, expRo
 	}
 	key := strings.TrimSpace(string(keyData))
 
-	ledger, err := budget.OpenOrInitLedger(expRoot, initLedger, budget.DefaultExperimentID)
-	if err != nil {
-		return fmt.Errorf("failed to open/init ledger: %w", err)
+	var ledger *budget.BudgetLedger
+	stateRoot := filepath.Join(os.Getenv("HOME"), ".local/state/guardfil")
+	if expRoot == "" {
+		ledger, err = budget.OpenProviderLedger(stateRoot, "openai", initLedger)
+		if err != nil {
+			return fmt.Errorf("failed to open/init openai ledger: %w", err)
+		}
+		expRoot = filepath.Join(stateRoot, budget.ProviderLedgerSpecs["openai"].TargetDir)
+	} else {
+		cleanExp := canonicalPathForGuard(expRoot)
+		cleanStateRoot := canonicalPathForGuard(stateRoot)
+		var matchedProvider string
+		var matchedIsLegacy bool
+		var matchedExact bool
+		for _, p := range budget.SupportedProviders {
+			spec := budget.ProviderLedgerSpecs[p]
+			legacyPath := canonicalPathForGuard(filepath.Join(cleanStateRoot, spec.LegacyDir))
+			targetPath := canonicalPathForGuard(filepath.Join(cleanStateRoot, spec.TargetDir))
+			if isPathEqualOrUnder(cleanExp, legacyPath) {
+				matchedProvider = p
+				matchedIsLegacy = true
+				matchedExact = (cleanExp == legacyPath)
+				break
+			}
+			if isPathEqualOrUnder(cleanExp, targetPath) {
+				matchedProvider = p
+				matchedIsLegacy = false
+				matchedExact = (cleanExp == targetPath)
+				break
+			}
+		}
+		if matchedProvider != "" {
+			if matchedIsLegacy {
+				return fmt.Errorf("%w: legacy %s directory %s cannot be opened directly via --experiment-root; run 'guardfil-broker migrate-ledger --provider %s'", budget.ErrLedgerMigrationRequired, matchedProvider, expRoot, matchedProvider)
+			}
+			if matchedProvider != "openai" || !matchedExact {
+				return fmt.Errorf("%w: --experiment-root %s is reserved for %s provider ledger", budget.ErrLedgerSecurity, expRoot, matchedProvider)
+			}
+			ledger, err = budget.OpenProviderLedger(stateRoot, "openai", initLedger)
+			if err != nil {
+				return fmt.Errorf("failed to open/init openai ledger: %w", err)
+			}
+			expRoot = filepath.Join(stateRoot, budget.ProviderLedgerSpecs["openai"].TargetDir)
+		} else {
+			ledger, err = budget.OpenOrInitLedger(expRoot, initLedger, budget.DefaultExperimentID)
+			if err != nil {
+				return fmt.Errorf("failed to open/init ledger: %w", err)
+			}
+		}
 	}
 	defer ledger.Close()
 

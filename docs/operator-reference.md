@@ -369,4 +369,4 @@ side effect occurred.
 - The deployment is local and single-user. Remote hosting, SSO and
   multi-tenant operation are out of scope for the alpha.
 - Further limits are in the README's [limits](../README.md#limits) and the
-  [release notes](releases/v0.1.0-alpha.3.md).
+  [release notes](releases/v0.1.0-alpha.4.md).

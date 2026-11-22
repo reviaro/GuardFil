@@ -14,9 +14,9 @@ these controls cover.
   GuardFil's broker, which holds the key and enforces a spending limit.
 - **Documentation:** Full user and operator guide in [docs/guide/](docs/guide/README.md).
 
-> **Alpha: [`v0.1.0-alpha.3`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.3).**
+> **Alpha: [`v0.1.0-alpha.4`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.4).**
 > Linux with Docker, for one person on one machine. Install from source using
-> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.3.md)
+> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.4.md)
 > and [limits](#limits) before relying on it. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
 > Licensed under the [GNU AGPL v3](LICENSE).
 
@@ -43,7 +43,7 @@ agents do not start: there is no fallback to the raw folder. See
 **1. Get GuardFil and set it up** (once):
 
 ```sh
-git clone --branch v0.1.0-alpha.3 --single-branch https://github.com/reviaro/GuardFil.git
+git clone --branch v0.1.0-alpha.4 --single-branch https://github.com/reviaro/GuardFil.git
 cd GuardFil
 deployments/local/guardfil-local.sh init --ui active
 ```
@@ -153,7 +153,7 @@ Edit the configuration files and restart the service to load changes. Use the
 to make guarded calls.
 Calls requiring approval stay blocked unless an owner client approves them;
 they cannot proceed just because the UI is absent. See
-[the approval service](docs/operator-reference.md#approval-service-optional)
+[the approval service](docs/operator-reference.md#approval-service)
 for the owner protocol.
 
 ## How it works
@@ -212,9 +212,10 @@ for the owner protocol.
 - Hosted CI runs three jobs on every commit: verification, executor and
   native-agent checks (including real nested mounts and real Docker bind
   admission), and the clean-runner quickstart. See the
-  [release notes](docs/releases/v0.1.0-alpha.3.md#verification) for details.
-- These checks use scripted provider stand-ins. The last live-model runs
-  predate the alpha releases.
+  [release notes](docs/releases/v0.1.0-alpha.4.md#verification) for details.
+- Live Ubuntu 24.04 alpha testing verified 7/7 boundary controls on a live
+  service/executor and a live Claude Code task inside the workspace; other
+  Linux distributions remain untested.
 
 ## Limits
 

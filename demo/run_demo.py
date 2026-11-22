@@ -278,7 +278,7 @@ def main():
                     f"{(' content=' + ','.join(m['list'] + ':' + m['action'] + 'x' + str(m['count']) for m in d['content'])) if d.get('content') else ''}")
         except OSError:
             pass
-        ev = Path("~/.local/state/guardfil/t2a-experiment").expanduser() / f"neutral-broker-{label}.jsonl"
+        ev = Path("~/.local/state/guardfil").expanduser() / f"neutral-broker-{label}.jsonl"
         if ev.exists():
             rows = [json.loads(l) for l in ev.read_text().splitlines()]
             say(f"\n=== model requests: {len(rows)}, counted cost {sum(r.get('cost_micros') or 0 for r in rows)} uUSD, "

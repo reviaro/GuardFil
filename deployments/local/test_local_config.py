@@ -20,6 +20,9 @@ with (home / 'docker-calls').open('a') as f:
     f.write(json.dumps(a) + '\n')
 if a[:2] == ['image', 'inspect']:
     sys.exit(int(os.environ.get('NO_IMAGE', '0')))
+if a[:1] == ['create']:
+    print('fake-cid')
+    sys.exit(0)
 if a[0] == 'run':
     assert '--read-only' in a and a[a.index('--network')+1] == 'none'
     assert '-validate-config' in a
@@ -129,6 +132,50 @@ class LocalConfigTest(unittest.TestCase):
         stale.bind(str(path))
         self.assertIsNone(gateway_socket(self.home))
         self.assertEqual(gateway_socket(self.home, path), path)
+
+    def bind_fake_approval_socket(self):
+        sock = socket.socket(socket.AF_UNIX)
+        self.addCleanup(sock.close)
+        sock.bind(str(self.home / "run/approval.sock"))
+
+    def docker_calls(self):
+        path = self.home / "docker-calls"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    def test_up_default_uses_build(self):
+        self.bind_fake_approval_socket()
+        self.run_cli("up")
+        calls = self.docker_calls()
+        compose_ups = [c for c in calls if len(c) >= 4 and c[0] == "compose" and "up" in c]
+        self.assertEqual(len(compose_ups), 1)
+        self.assertIn("--build", compose_ups[0])
+        self.assertIn("-d", compose_ups[0])
+        self.assertNotIn("--no-build", compose_ups[0])
+
+    def test_up_no_build_uses_prebuilt_image(self):
+        self.bind_fake_approval_socket()
+        self.run_cli("up", "--no-build")
+        calls = self.docker_calls()
+        self.assertIn(["image", "inspect", "guardfil-local:dev"], calls)
+        compose_ups = [c for c in calls if len(c) >= 4 and c[0] == "compose" and "up" in c]
+        self.assertEqual(len(compose_ups), 1)
+        self.assertIn("--no-build", compose_ups[0])
+        self.assertIn("-d", compose_ups[0])
+        self.assertNotIn("--build", compose_ups[0])
+
+    def test_up_no_build_fails_when_image_missing(self):
+        res = self.run_cli("up", "--no-build", ok=False, NO_IMAGE="1")
+        self.assertIn("guardfil-local:dev", res.stderr)
+        compose_ups = [c for c in self.docker_calls() if len(c) >= 4 and c[0] == "compose" and "up" in c]
+        self.assertEqual(compose_ups, [])
+
+    def test_up_rejects_unknown_option(self):
+        res = self.run_cli("up", "--bogus", ok=False)
+        self.assertIn("usage:", res.stderr)
+        compose_ups = [c for c in self.docker_calls() if len(c) >= 4 and c[0] == "compose" and "up" in c]
+        self.assertEqual(compose_ups, [])
 
 
 if __name__ == "__main__":

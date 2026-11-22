@@ -62,7 +62,7 @@ deployments/local/guardfil-local.sh <command> [options]
 | Command | Usage | Description |
 | --- | --- | --- |
 | `init` | `guardfil-local.sh init [--ui none\|inactive\|active]` | Creates `$GF_HOME`, sets permissions (`0700`/`0600`), installs default policy and catalog files, and generates UI and metrics tokens. |
-| `up` | `guardfil-local.sh up` | Builds and launches the GuardFil service container in the background, waits for `approval.sock` to become ready, extracts helper binaries into `$GF_HOME/bin/`, and displays service status. |
+| `up` | `guardfil-local.sh up [--no-build]` | Builds (unless `--no-build` is passed to start an already-built `guardfil-local:dev` image) and launches the GuardFil service container in the background, waits for `approval.sock` to become ready, extracts helper binaries into `$GF_HOME/bin/`, and displays service status. |
 | `check` | `guardfil-local.sh check` | Verifies the host can serve a mediated workspace (FUSE 3 and `user_allow_other`); exits non-zero with the fix if not. `init` and `up` print the same finding as a warning. |
 | `status` | `guardfil-local.sh status` | Checks socket connectivity, prints the Web UI URL and token file location, and shows the decision log path. |
 | `ui` | `guardfil-local.sh ui <none\|inactive\|active>` | Toggles the Web UI mode and restarts the GuardFil service container. |

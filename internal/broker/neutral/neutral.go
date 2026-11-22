@@ -62,9 +62,9 @@ var (
 		RootPath string
 		ExpID    string
 	}{
-		"openai":    {RootPath: filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/t2a-experiment"), ExpID: "guardfil-t2a-m1-openai-luna"},
-		"gemini":    {RootPath: filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/gemini-experiment-6"), ExpID: "guardfil-m4-gemini-6"},
-		"anthropic": {RootPath: filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/anthropic-experiment"), ExpID: "guardfil-m4-anthropic"},
+		"openai":    {RootPath: filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/openai"), ExpID: "guardfil-openai-v1"},
+		"gemini":    {RootPath: filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/gemini"), ExpID: "guardfil-gemini-v1"},
+		"anthropic": {RootPath: filepath.Join(os.Getenv("HOME"), ".local/state/guardfil/anthropic"), ExpID: "guardfil-anthropic-v1"},
 	}
 )
 
@@ -119,6 +119,8 @@ type NeutralBrokerServer struct {
 	stopped       bool
 	busy          bool
 	stopRequested bool
+	stopMu        sync.Mutex
+	listener      net.Listener
 	mu            sync.Mutex
 	sleepFn       func(time.Duration)
 }
@@ -422,7 +424,16 @@ func toInt(v any) int {
 	}
 }
 
+func (s *NeutralBrokerServer) isStopRequested() bool {
+	s.stopMu.Lock()
+	defer s.stopMu.Unlock()
+	return s.stopRequested
+}
+
 func (s *NeutralBrokerServer) Serve(sockPath string) error {
+	if s.isStopRequested() {
+		return nil
+	}
 	_ = os.Remove(sockPath)
 	oldMask := syscall.Umask(0077)
 	l, err := net.Listen("unix", sockPath)
@@ -430,7 +441,21 @@ func (s *NeutralBrokerServer) Serve(sockPath string) error {
 	if err != nil {
 		return err
 	}
+	s.stopMu.Lock()
+	if s.stopRequested {
+		s.stopMu.Unlock()
+		_ = l.Close()
+		_ = os.Remove(sockPath)
+		return nil
+	}
+	s.listener = l
+	s.stopMu.Unlock()
 	defer func() {
+		s.stopMu.Lock()
+		if s.listener == l {
+			s.listener = nil
+		}
+		s.stopMu.Unlock()
 		_ = l.Close()
 		_ = os.Remove(sockPath)
 	}()
@@ -441,7 +466,7 @@ func (s *NeutralBrokerServer) Serve(sockPath string) error {
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			if s.stopRequested {
+			if s.isStopRequested() {
 				break
 			}
 			return err
@@ -451,7 +476,7 @@ func (s *NeutralBrokerServer) Serve(sockPath string) error {
 		s.handleConn(conn)
 		s.busy = false
 
-		if s.stopRequested {
+		if s.isStopRequested() {
 			break
 		}
 	}
@@ -489,7 +514,13 @@ func (s *NeutralBrokerServer) handleConn(conn net.Conn) {
 }
 
 func (s *NeutralBrokerServer) RequestStop() {
+	s.stopMu.Lock()
 	s.stopRequested = true
+	l := s.listener
+	s.stopMu.Unlock()
+	if l != nil {
+		_ = l.Close()
+	}
 }
 
 func CheckModels(keys map[string]string) int {
@@ -610,21 +641,33 @@ func RunNeutralBroker(sockdir string, label string, maxRequests int, checkFlag b
 		return err
 	}
 
+	stateRoot := filepath.Join(os.Getenv("HOME"), ".local/state/guardfil")
 	ledgers := make(map[string]*budget.BudgetLedger)
+	closeOpened := func() {
+		for _, l := range ledgers {
+			_ = l.Close()
+		}
+	}
 	for p := range keys {
-		lr := LedgerRoots[p]
-		if lr.RootPath == "" {
+		if _, ok := budget.ProviderLedgerSpecs[p]; !ok {
 			continue
 		}
-		l, err := budget.OpenOrInitLedger(lr.RootPath, true, lr.ExpID)
-		if err == nil {
-			st, err2 := l.GetStatus()
-			if err2 == nil && st.CanReserve() {
-				ledgers[p] = l
-			} else {
-				fmt.Fprintf(os.Stderr, "%s ledger cannot reserve; %s disabled\n", p, p)
-				_ = l.Close()
+		l, err := budget.OpenProviderLedger(stateRoot, p, true)
+		if err != nil {
+			if errors.Is(err, budget.ErrLedgerMigrationRequired) {
+				closeOpened()
+				fmt.Fprintf(os.Stderr, "%v\n", err)
+				return err
 			}
+			fmt.Fprintf(os.Stderr, "%s ledger unavailable (%v); %s disabled\n", p, err, p)
+			continue
+		}
+		st, err2 := l.GetStatus()
+		if err2 == nil && st.CanReserve() {
+			ledgers[p] = l
+		} else {
+			fmt.Fprintf(os.Stderr, "%s ledger cannot reserve; %s disabled\n", p, p)
+			_ = l.Close()
 		}
 	}
 
@@ -650,7 +693,7 @@ func RunNeutralBroker(sockdir string, label string, maxRequests int, checkFlag b
 	sort.Strings(pNames)
 	fmt.Fprintf(os.Stderr, "NEUTRAL_BROKER_PROVIDERS %s\n", strings.Join(pNames, ","))
 
-	evidencePath := filepath.Join(LedgerRoots["openai"].RootPath, fmt.Sprintf("neutral-broker-%s.jsonl", label))
+	evidencePath := filepath.Join(stateRoot, fmt.Sprintf("neutral-broker-%s.jsonl", label))
 	srv, err := NewNeutralBrokerServer(ledgers, label, maxRequests, keys, nil, evidencePath, DefaultLiveProviders, budget.ProviderModels, prior)
 	if err != nil {
 		return err

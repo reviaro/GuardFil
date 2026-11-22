@@ -15,4 +15,7 @@ var (
 	ErrLedgerCorrupt            = errors.New("ledger state corrupt or invalid")
 	ErrLedgerSecurity           = errors.New("ledger security violation")
 	ErrGuardUnfinished          = errors.New("unfinished inspection guard")
+	ErrLedgerMigrationRequired  = errors.New("legacy ledger migration required")
+	ErrMigrationState           = errors.New("ledger migration state invalid")
+	ErrEvidenceCopy             = errors.New("broker evidence file invalid")
 )

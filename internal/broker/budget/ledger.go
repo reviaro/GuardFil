@@ -17,6 +17,9 @@ import (
 type JournalEntry struct {
 	EntryType                string   `json:"entry_type"`
 	ExperimentID             string   `json:"experiment_id,omitempty"`
+	FromExperimentID         string   `json:"from_experiment_id,omitempty"`
+	InspectionGeneration     int      `json:"inspection_generation,omitempty"`
+	LegacyDirName            string   `json:"legacy_dir_name,omitempty"`
 	GlobalCeilingMicros      int      `json:"global_ceiling_micros,omitempty"`
 	ReservationID            string   `json:"reservation_id,omitempty"`
 	RequestID                string   `json:"request_id,omitempty"`
@@ -49,6 +52,7 @@ type PendingReservationData struct {
 type LedgerState struct {
 	SchemaVersion           int                     `json:"schema_version"`
 	ExperimentID            string                  `json:"experiment_id"`
+	LegacyExperimentID      string                  `json:"legacy_experiment_id,omitempty"`
 	CreatedAtUTC            string                  `json:"created_at_utc"`
 	UpdatedAtUTC            string                  `json:"updated_at_utc"`
 	GlobalCeilingMicros     int                     `json:"global_ceiling_micros"`
@@ -286,16 +290,20 @@ func writeStateFile(fs ledgerFS, dir string, state *LedgerState) error {
 }
 
 func readStateFile(dir string, expectedExpID string) (*LedgerState, error) {
-	statePath := filepath.Join(dir, StateFilename)
+	return readStateFileByName(dir, StateFilename, expectedExpID)
+}
+
+func readStateFileByName(dir string, filename string, expectedExpID string) (*LedgerState, error) {
+	statePath := filepath.Join(dir, filename)
 	fd, err := syscall.Open(statePath, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return nil, ErrLedgerNotFound
 		}
 		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("%w: symlink detected on state path", ErrLedgerSecurity)
+			return nil, fmt.Errorf("%w: symlink detected on state path %s", ErrLedgerSecurity, filename)
 		}
-		return nil, fmt.Errorf("%w: cannot open state file: %v", ErrLedgerSecurity, err)
+		return nil, fmt.Errorf("%w: cannot open state file %s: %v", ErrLedgerSecurity, filename, err)
 	}
 	defer syscall.Close(fd)
 
@@ -312,11 +320,18 @@ func readStateFile(dir string, expectedExpID string) (*LedgerState, error) {
 	}
 
 	data := make([]byte, st.Size)
-	n, err := syscall.Read(fd, data)
-	if err != nil {
-		return nil, fmt.Errorf("%w: read state failed: %v", ErrLedgerCorrupt, err)
+	total := 0
+	for total < len(data) {
+		n, rerr := syscall.Read(fd, data[total:])
+		if rerr != nil {
+			return nil, fmt.Errorf("%w: read state failed: %v", ErrLedgerCorrupt, rerr)
+		}
+		if n == 0 {
+			break
+		}
+		total += n
 	}
-	data = data[:n]
+	data = data[:total]
 
 	val, err := safeJSONDecode(data)
 	if err != nil {
@@ -421,6 +436,18 @@ func completeGuard(fs ledgerFS, dir string, expID string, gen int) error {
 	return publishBytes(fs, dir, InspectionCompletionFilename, ".tmp_comp_", compEnc)
 }
 
+func migratedInspectionGen(state *LedgerState) int {
+	if state == nil {
+		return 0
+	}
+	for _, e := range state.Journal {
+		if e.EntryType == "MIGRATED" {
+			return e.InspectionGeneration
+		}
+	}
+	return 0
+}
+
 func (l *BudgetLedger) guardedState() (*LedgerState, error) {
 	gen, err := armGuard(l.getFS(), l.ledgerDir, l.experimentID)
 	if err != nil {
@@ -437,6 +464,11 @@ func (l *BudgetLedger) guardedState() (*LedgerState, error) {
 		l.poisonHandle("INSPECTION_EVIDENCE_UNCERTAINTY")
 		l.releaseLease()
 		return nil, err
+	}
+	if minGen := migratedInspectionGen(state); minGen > 0 && gen <= minGen {
+		l.poisonHandle("INSPECTION_GUARD_CORRUPT")
+		l.releaseLease()
+		return nil, fmt.Errorf("%w: inspection generation %d precedes migration generation %d", ErrLedgerCorrupt, gen-1, minGen)
 	}
 	state, uncertain, err := l.validateAndRecoverRecordsUnderLock(state, l.ledgerDir)
 	if err != nil {
@@ -473,14 +505,26 @@ func isLeaseHeld(dir string) bool {
 	return errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EACCES)
 }
 
-// Initialize initializes a brand new budget ledger in a non-existent directory.
+// Initialize initializes a brand new budget ledger (schema v1) in a non-existent directory.
 func Initialize(ledgerDir string, experimentID string) (*BudgetLedger, error) {
 	return initializeInternal(ledgerDir, experimentID, defaultFS)
 }
 
+// InitializeV2 initializes a brand new schema-v2 budget ledger in a non-existent directory.
+func InitializeV2(ledgerDir string, experimentID string) (*BudgetLedger, error) {
+	return initializeWithVersion(ledgerDir, experimentID, SchemaVersionV2, defaultFS)
+}
+
 func initializeInternal(ledgerDir string, experimentID string, fs ledgerFS) (*BudgetLedger, error) {
+	return initializeWithVersion(ledgerDir, experimentID, SchemaVersion, fs)
+}
+
+func initializeWithVersion(ledgerDir string, experimentID string, schemaVersion int, fs ledgerFS) (*BudgetLedger, error) {
 	if fs == nil {
 		fs = defaultFS
+	}
+	if schemaVersion != SchemaVersion && schemaVersion != SchemaVersionV2 {
+		return nil, fmt.Errorf("%w: unsupported schema version %d", ErrLedgerCorrupt, schemaVersion)
 	}
 	if experimentID == "" {
 		experimentID = DefaultExperimentID
@@ -514,7 +558,7 @@ func initializeInternal(ledgerDir string, experimentID string, fs ledgerFS) (*Bu
 
 	now := nowUTCStr()
 	initialState := &LedgerState{
-		SchemaVersion:           SchemaVersion,
+		SchemaVersion:           schemaVersion,
 		ExperimentID:            experimentID,
 		CreatedAtUTC:            now,
 		UpdatedAtUTC:            now,
@@ -580,10 +624,20 @@ func (l *BudgetLedger) validateAndRecoverRecordsUnderLock(state *LedgerState, di
 	knownIDs := make(map[string]bool)
 	reservedAmounts := make(map[string]int)
 	settledEntries := make(map[string]JournalEntry)
+	expectedExpForRes := make(map[string]string)
+	seenMigrated := false
 	for _, e := range state.Journal {
+		if e.EntryType == "MIGRATED" {
+			seenMigrated = true
+		}
 		if e.EntryType == "RESERVED" {
 			knownIDs[e.ReservationID] = true
 			reservedAmounts[e.ReservationID] = e.ReservedAmountMicros
+			if state.LegacyExperimentID != "" && !seenMigrated {
+				expectedExpForRes[e.ReservationID] = state.LegacyExperimentID
+			} else {
+				expectedExpForRes[e.ReservationID] = expID
+			}
 		}
 		if e.EntryType == "SETTLED" {
 			settledEntries[e.ReservationID] = e
@@ -622,8 +676,12 @@ func (l *BudgetLedger) validateAndRecoverRecordsUnderLock(state *LedgerState, di
 		intentName := fmt.Sprintf("%s%s.json", IntentFilePrefix, resID)
 		confName := fmt.Sprintf("%s%s.json", ConfirmationFilePrefix, resID)
 
-		intentRec, intentErr := readWitnessRecord(dir, intentName, "SETTLEMENT_INTENT", expID)
-		confRec, confErr := readWitnessRecord(dir, confName, "SETTLEMENT_CONFIRMATION", expID)
+		witnessExpID := expID
+		if mappedExpID, ok := expectedExpForRes[resID]; ok {
+			witnessExpID = mappedExpID
+		}
+		intentRec, intentErr := readWitnessRecord(dir, intentName, "SETTLEMENT_INTENT", witnessExpID)
+		confRec, confErr := readWitnessRecord(dir, confName, "SETTLEMENT_CONFIRMATION", witnessExpID)
 
 		attributable := knownIDs[resID]
 		jSettled, isSettled := settledEntries[resID]
@@ -808,6 +866,9 @@ func openInternal(ledgerDir string, fs ledgerFS) (*BudgetLedger, error) {
 				if err2 != nil {
 					return err2
 				}
+				if minGen := migratedInspectionGen(st); minGen > 0 && guard.Generation < minGen {
+					return fmt.Errorf("%w: inspection generation %d precedes migration generation %d", ErrLedgerCorrupt, guard.Generation, minGen)
+				}
 				reason := "UNFINISHED_INSPECTION_GUARD"
 				if st != nil && st.Halted && st.HaltReason != nil {
 					reason = *st.HaltReason
@@ -829,6 +890,9 @@ func openInternal(ledgerDir string, fs ledgerFS) (*BudgetLedger, error) {
 		state, err := readStateFile(absDir, expID)
 		if err != nil {
 			return err
+		}
+		if minGen := migratedInspectionGen(state); minGen > 0 && gen <= minGen {
+			return fmt.Errorf("%w: inspection generation %d precedes migration generation %d", ErrLedgerCorrupt, gen-1, minGen)
 		}
 
 		state, uncertain, err := b.validateAndRecoverRecordsUnderLock(state, absDir)

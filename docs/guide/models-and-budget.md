@@ -84,9 +84,18 @@ Each provider operates with its own independent, append-only budget ledger (`int
 - **Request Cap**: Up to 256 forwarded requests per ledger over its lifetime. Each session also has its own `--max-requests` cap.
 - **Concurrency**: At most one request in flight per ledger.
 - **Storage Location**:
-  - OpenAI: `~/.local/state/guardfil/t2a-experiment/`
-  - Gemini: `~/.local/state/guardfil/gemini-experiment-6/`
-  - Anthropic: `~/.local/state/guardfil/anthropic-experiment/`
+  - OpenAI: `~/.local/state/guardfil/openai/`
+  - Gemini: `~/.local/state/guardfil/gemini/`
+  - Anthropic: `~/.local/state/guardfil/anthropic/`
+
+Upgrading from an earlier alpha version that created legacy ledger folders (`t2a-experiment`, `gemini-experiment-6`, or `anthropic-experiment`)? Inspect and migrate them before starting an agent:
+
+```sh
+guardfil-broker migrate-ledger --provider all --dry-run
+guardfil-broker migrate-ledger --provider all
+```
+
+The brokers refuse to start rather than silently opening a fresh ledger when an unmigrated legacy ledger is present.
 
 ---
 

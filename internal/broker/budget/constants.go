@@ -18,8 +18,16 @@ const (
 	PinnedModel       = "gpt-6-luna"
 	PinnedServiceTier = "default"
 
-	DefaultExperimentID = "guardfil-t2a-m1-openai-luna"
-	SchemaVersion       = 1
+	DefaultExperimentID        = "guardfil-openai-v1"
+	SchemaVersion              = 1
+	SchemaVersionV2            = 2
+	TombstoneFilename          = "migrated_to.json"
+	TombstoneModeMigrated      = "migrated"
+	TombstoneModeFreshV2       = "fresh_v2"
+	PreMigrationBackupFilename = "ledger.json.pre-migration-backup"
+	MigrationReasonCLI         = "CLI_MIGRATE"
+
+	MaxEvidenceFileBytes = 64 * 1024 * 1024 // 64 MiB
 
 	StateFilename                = "ledger.json"
 	LockFilename                 = "ledger.lock"
@@ -32,16 +40,35 @@ const (
 	RecordTypeInspectionGuard    = "INSPECTION_GUARD"
 	RecordTypeInspectionComp     = "INSPECTION_COMPLETION"
 
-	MaxInspectionGeneration = 1_000_000_000
-	MaxStateFileBytes       = 524_288 // 512 KiB
-	MaxIdentifierLength     = 128
-	MaxDigestLength         = 128
-	MaxTimestampLength      = 64
-	MaxReasonLength         = 256
-	MaxJournalEntries       = 514
+	MaxInspectionGeneration   = 1_000_000_000
+	MaxStateFileBytes         = 524_288 // 512 KiB
+	MaxIdentifierLength       = 128
+	MaxDigestLength           = 128
+	MaxTimestampLength        = 64
+	MaxReasonLength           = 256
+	MaxJournalEntries         = 514
+	MaxMigratedJournalEntries = 515
 
 	TerminalStatusCompleted = "completed"
 )
+
+// ProviderLedgerSpec maps a model provider to its legacy and current ledger
+// directory names (relative to ~/.local/state/guardfil) and experiment IDs.
+type ProviderLedgerSpec struct {
+	Provider  string
+	LegacyDir string
+	LegacyID  string
+	TargetDir string
+	TargetID  string
+}
+
+var SupportedProviders = []string{"openai", "anthropic", "gemini"}
+
+var ProviderLedgerSpecs = map[string]ProviderLedgerSpec{
+	"openai":    {Provider: "openai", LegacyDir: "t2a-experiment", LegacyID: "guardfil-t2a-m1-openai-luna", TargetDir: "openai", TargetID: "guardfil-openai-v1"},
+	"anthropic": {Provider: "anthropic", LegacyDir: "anthropic-experiment", LegacyID: "guardfil-m4-anthropic", TargetDir: "anthropic", TargetID: "guardfil-anthropic-v1"},
+	"gemini":    {Provider: "gemini", LegacyDir: "gemini-experiment-6", LegacyID: "guardfil-m4-gemini-6", TargetDir: "gemini", TargetID: "guardfil-gemini-v1"},
+}
 
 type ModelRate struct {
 	InputRateMicros  int
@@ -117,4 +144,5 @@ var ValidJournalEntryTypes = map[string]bool{
 	"FAILED_RETAINED":         true,
 	"ORPHANED_PENDING_HALTED": true,
 	"TERMINAL_UNCERTAINTY":    true,
+	"MIGRATED":                true,
 }

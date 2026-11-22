@@ -16,6 +16,7 @@ var journalKeys = map[string][]string{
 	"FAILED_RETAINED":         {"entry_type", "reason", "request_id", "reservation_id", "retained_amount_micros", "timestamp_utc"},
 	"ORPHANED_PENDING_HALTED": {"entry_type", "reason", "request_id", "reservation_id", "retained_amount_micros", "timestamp_utc"},
 	"TERMINAL_UNCERTAINTY":    {"entry_type", "reason", "timestamp_utc", "uncertain_reservation_ids"},
+	"MIGRATED":                {"entry_type", "experiment_id", "from_experiment_id", "inspection_generation", "legacy_dir_name", "reason", "timestamp_utc"},
 }
 
 var settlementRecordKeys = []string{"experiment_id", "input_tokens", "model", "output_tokens", "record_type", "request_digest", "request_id", "reservation_id", "response_id", "service_tier", "settled_amount_micros", "timestamp_utc", "total_tokens", "unencumbered_amount_micros"}
@@ -34,8 +35,10 @@ func (e JournalEntry) MarshalJSON() ([]byte, error) {
 		return nil, fmt.Errorf("unknown journal entry type %q", e.EntryType)
 	}
 	all := map[string]any{
-		"entry_type": e.EntryType, "experiment_id": e.ExperimentID, "global_ceiling_micros": e.GlobalCeilingMicros,
-		"reservation_id": e.ReservationID, "request_id": e.RequestID, "request_digest": e.RequestDigest,
+		"entry_type": e.EntryType, "experiment_id": e.ExperimentID, "from_experiment_id": e.FromExperimentID,
+		"inspection_generation": e.InspectionGeneration, "legacy_dir_name": e.LegacyDirName,
+		"global_ceiling_micros": e.GlobalCeilingMicros,
+		"reservation_id":        e.ReservationID, "request_id": e.RequestID, "request_digest": e.RequestDigest,
 		"reserved_amount_micros": e.ReservedAmountMicros, "reservation_index": e.ReservationIndex,
 		"response_id": e.ResponseID, "model": e.Model, "service_tier": e.ServiceTier,
 		"input_tokens": e.InputTokens, "output_tokens": e.OutputTokens, "total_tokens": e.TotalTokens,
