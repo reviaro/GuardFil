@@ -1002,6 +1002,31 @@ func classifyLegacyWithoutState(legacyRoot string) (bool, error) {
 	return true, nil
 }
 
+// Initializers publish the legacy scaffold before the target. Inspect in reverse
+// order so a concurrent publication cannot look like a target without a scaffold.
+func providerScaffoldExists(legacyRoot, targetRoot string) (bool, error) {
+	targetExists, err := ledgerDirExists(targetRoot)
+	if err != nil {
+		return false, err
+	}
+	legacyExists, err := ledgerDirExists(legacyRoot)
+	if err != nil {
+		return false, err
+	}
+	if targetExists && !legacyExists {
+		return false, fmt.Errorf("%w: %w: target %s lacks matching legacy retirement scaffold", ErrLedgerCorrupt, ErrMigrationState, targetRoot)
+	}
+	return legacyExists, nil
+}
+
+func ledgerDirExists(path string) (bool, error) {
+	err := checkDirPath(path)
+	if errors.Is(err, ErrLedgerNotFound) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
 // OpenProviderLedger opens the provider's migrated/v2 ledger (or initializes a
 // fresh schema-v2 ledger plus a legacy sentinel scaffold when neither legacy nor
 // target exists and initialize is true), failing closed on unmigrated,
@@ -1024,16 +1049,11 @@ func openProviderLedgerWithHook(stateRoot string, provider string, initialize bo
 	targetRoot := filepath.Join(absRoot, spec.TargetDir)
 	targetLedgerDir := filepath.Join(targetRoot, "ledger")
 
-	legacyExists := false
-	legacyTombstoned := false
-	var tomb *MigrationTombstone
-	var backupState *LedgerState
-
-	if _, lerr := os.Lstat(legacyRoot); lerr == nil {
-		legacyExists = true
-		if err := checkDirPath(legacyRoot); err != nil {
-			return nil, fmt.Errorf("%w: invalid legacy directory for %s: %v", ErrLedgerSecurity, provider, err)
-		}
+	legacyExists, err := providerScaffoldExists(legacyRoot, targetRoot)
+	if err != nil {
+		return nil, err
+	}
+	if legacyExists {
 		legacyStatePath := filepath.Join(legacyLedgerDir, StateFilename)
 		if _, stErr := os.Lstat(legacyStatePath); stErr == nil {
 			return nil, fmt.Errorf("%w: legacy %s ledger at %s must be migrated first: run 'guardfil-broker migrate-ledger --provider %s'", ErrLedgerMigrationRequired, provider, legacyRoot, provider)
@@ -1084,7 +1104,7 @@ func openProviderLedgerWithHook(stateRoot string, provider string, initialize bo
 			return nil, fmt.Errorf("%w: %w: cannot stat migration intent: %v", ErrLedgerSecurity, ErrMigrationState, iErr)
 		}
 
-		tomb, backupState, err = verifyRetiredLegacyScaffold(legacyRoot, spec)
+		tomb, backupState, err := verifyRetiredLegacyScaffold(legacyRoot, spec)
 		if err != nil {
 			if errors.Is(err, ErrLedgerNotFound) {
 				_, tgtErr := os.Lstat(targetRoot)
@@ -1100,17 +1120,12 @@ func openProviderLedgerWithHook(stateRoot string, provider string, initialize bo
 			}
 			return nil, fmt.Errorf("%w: %w: legacy %s retirement scaffold invalid: %w", ErrLedgerCorrupt, ErrMigrationState, provider, err)
 		}
-		legacyTombstoned = true
-	} else if !os.IsNotExist(lerr) {
-		return nil, fmt.Errorf("%w: cannot stat legacy directory %s: %v", ErrLedgerSecurity, legacyRoot, lerr)
-	}
-
-	if _, terr := os.Lstat(targetRoot); terr == nil {
-		if err := checkDirPath(targetRoot); err != nil {
+		// A concurrent initializer may have published the target while we waited
+		// for its scaffold lock. Validate the target under that lock.
+		if err := checkDirPath(targetRoot); errors.Is(err, ErrLedgerNotFound) {
+			return nil, fmt.Errorf("%w: %w: retired legacy %s ledger has missing target %s", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
+		} else if err != nil {
 			return nil, err
-		}
-		if !legacyExists || !legacyTombstoned {
-			return nil, fmt.Errorf("%w: %w: target %s directory %s lacks matching legacy retirement scaffold", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
 		}
 		if err := checkDirPath(targetLedgerDir); err != nil {
 			return nil, err
@@ -1131,13 +1146,8 @@ func openProviderLedgerWithHook(stateRoot string, provider string, initialize bo
 			return nil, fmt.Errorf("%w: %w: target %s ledger experiment_id %q != expected %q", ErrLedgerCorrupt, ErrMigrationState, provider, l.experimentID, spec.TargetID)
 		}
 		return l, nil
-	} else if !os.IsNotExist(terr) {
-		return nil, fmt.Errorf("%w: cannot stat target directory %s: %v", ErrLedgerSecurity, targetRoot, terr)
 	}
 
-	if legacyTombstoned || legacyExists {
-		return nil, fmt.Errorf("%w: %w: legacy %s ledger is tombstoned as migrated but target directory %s is missing", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
-	}
 	if !initialize {
 		return nil, ErrLedgerNotFound
 	}
@@ -1274,7 +1284,7 @@ func openProviderLedgerWithHook(stateRoot string, provider string, initialize bo
 	_ = syscall.Close(lockFD)
 	lockFD = -1
 
-	tomb, backupState, err = verifyRetiredLegacyScaffold(legacyRoot, spec)
+	tomb, backupState, err := verifyRetiredLegacyScaffold(legacyRoot, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -1783,47 +1793,19 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 	targetRoot := filepath.Join(absRoot, spec.TargetDir)
 	targetLedgerDir := filepath.Join(targetRoot, "ledger")
 
-	_, legStatErr := os.Lstat(legacyRoot)
-	legacyExists := legStatErr == nil
-	if legStatErr != nil && !os.IsNotExist(legStatErr) {
-		return nil, fmt.Errorf("%w: cannot stat legacy root %s: %v", ErrLedgerSecurity, legacyRoot, legStatErr)
+	legacyExists, err := providerScaffoldExists(legacyRoot, targetRoot)
+	if err != nil {
+		return nil, err
 	}
-	_, tgtStatErr := os.Lstat(targetRoot)
-	targetExists := tgtStatErr == nil
-	if tgtStatErr != nil && !os.IsNotExist(tgtStatErr) {
-		return nil, fmt.Errorf("%w: cannot stat target root %s: %v", ErrLedgerSecurity, targetRoot, tgtStatErr)
-	}
-
-	if !legacyExists && !targetExists {
+	if !legacyExists {
 		return makeMigrationResult(provider, "not_initialized", legacyRoot, targetRoot, nil), nil
 	}
 
-	if legacyExists {
-		if err := checkDirPath(legacyRoot); err != nil {
-			return nil, err
-		}
+	_, stateErr := os.Lstat(filepath.Join(legacyLedgerDir, StateFilename))
+	if stateErr != nil && !os.IsNotExist(stateErr) {
+		return nil, fmt.Errorf("%w: cannot stat legacy state: %v", ErrLedgerSecurity, stateErr)
 	}
-	if targetExists {
-		if err := checkDirPath(targetRoot); err != nil {
-			return nil, err
-		}
-	}
-
-	legacyStateExists := false
-	if legacyExists {
-		legacyStatePath := filepath.Join(legacyLedgerDir, StateFilename)
-		if _, err := os.Lstat(legacyStatePath); err == nil {
-			legacyStateExists = true
-		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("%w: cannot stat legacy state %s: %v", ErrLedgerSecurity, legacyStatePath, err)
-		}
-	}
-
-	if !legacyStateExists {
-		if !legacyExists {
-			return nil, fmt.Errorf("%w: %w: target %s directory %s lacks matching legacy retirement scaffold", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
-		}
-
+	if os.IsNotExist(stateErr) {
 		var unlockScaffold func()
 		if _, lockStatErr := os.Lstat(filepath.Join(legacyLedgerDir, LockFilename)); lockStatErr == nil {
 			unlockScaffold, err = lockLegacyScaffold(legacyLedgerDir)
@@ -1866,6 +1848,10 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 			return nil, fmt.Errorf("%w: %w: cannot stat migration intent: %v", ErrLedgerSecurity, ErrMigrationState, iErr)
 		}
 
+		targetExists, err := ledgerDirExists(targetRoot)
+		if err != nil {
+			return nil, err
+		}
 		tomb, backupState, err := verifyRetiredLegacyScaffold(legacyRoot, spec)
 		if err != nil {
 			if errors.Is(err, ErrLedgerNotFound) {
@@ -1955,6 +1941,10 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 	}
 
 	// Subcase A: targetRoot already exists -> interrupted migration recovery.
+	targetExists, err := ledgerDirExists(targetRoot)
+	if err != nil {
+		return nil, err
+	}
 	if targetExists {
 		targetState, err := inspectTargetLedgerReadOnly(targetLedgerDir, spec.TargetID)
 		if err != nil {

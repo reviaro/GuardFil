@@ -1809,9 +1809,26 @@ func TestResumableFreshInitAndEmptyLegacyRetirementAcrossFaults(t *testing.T) {
 				errs[idx] = err
 			}(i)
 		}
+		// A read-only migration inspection can race the first open as well.
+		// Before publication it sees a new provider. After publication it must
+		// validate the same v2 ledger that the initializers return.
+		var inspection *MigrationResult
+		var inspectErr error
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			inspection, inspectErr = MigrateProviderLedger(stateRoot, "openai", true)
+		}()
 		close(start)
 		wg.Wait()
 
+		if inspectErr != nil {
+			t.Fatalf("concurrent dry run: %v", inspectErr)
+		}
+		if inspection.Status != "not_initialized" && inspection.Status != "initialized_v2" {
+			t.Fatalf("unexpected concurrent dry-run result: %s", inspection.Status)
+		}
 		for i := 0; i < workers; i++ {
 			if errs[i] != nil {
 				t.Fatalf("concurrent initializer %d failed: %v", i, errs[i])

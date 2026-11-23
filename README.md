@@ -14,9 +14,9 @@ these controls cover.
   GuardFil's broker, which holds the key and enforces a spending limit.
 - **Documentation:** Full user and operator guide in [docs/guide/](docs/guide/README.md).
 
-> **Alpha: [`v0.1.0-alpha.5`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.5).**
+> **Alpha: [`v0.1.0-alpha.6`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.6).**
 > Linux with Docker, for one person on one machine. Install from source using
-> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.5.md)
+> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.6.md)
 > and [limits](#limits) before relying on it. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
 > Licensed under the [GNU AGPL v3](LICENSE).
 
@@ -43,7 +43,7 @@ agents do not start: there is no fallback to the raw folder. See
 **1. Get GuardFil and set it up** (once):
 
 ```sh
-git clone --branch v0.1.0-alpha.5 --single-branch https://github.com/reviaro/GuardFil.git
+git clone --branch v0.1.0-alpha.6 --single-branch https://github.com/reviaro/GuardFil.git
 cd GuardFil
 deployments/local/guardfil-local.sh init --ui active
 ```
@@ -212,7 +212,7 @@ for the owner protocol.
 - Hosted CI runs three jobs on every commit: verification, executor and
   native-agent checks (including real nested mounts and real Docker bind
   admission), and the clean-runner quickstart. See the
-  [release notes](docs/releases/v0.1.0-alpha.5.md#verification) for details.
+  [release notes](docs/releases/v0.1.0-alpha.6.md#verification) for details.
 - Live Ubuntu 24.04 alpha testing verified 7/7 boundary controls on a live
   service/executor and a live Claude Code task inside the workspace; other
   Linux distributions remain untested.
