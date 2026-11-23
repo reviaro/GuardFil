@@ -323,7 +323,7 @@ mkdir -p deployments/example/credentials.d
 umask 077
 printf '%s\n' 'replace-with-a-local-metrics-token' > deployments/example/credentials.d/metrics-token
 chmod 600 deployments/example/credentials.d/metrics-token
-export GO_BUILDER_IMAGE='golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195'
+export GO_BUILDER_IMAGE='golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea'
 docker compose -f deployments/example/compose.yaml up --build
 ```
 
@@ -369,4 +369,4 @@ side effect occurred.
 - The deployment is local and single-user. Remote hosting, SSO and
   multi-tenant operation are out of scope for the alpha.
 - Further limits are in the README's [limits](../README.md#limits) and the
-  [release notes](releases/v0.1.0-alpha.4.md).
+  [release notes](releases/v0.1.0-alpha.5.md).

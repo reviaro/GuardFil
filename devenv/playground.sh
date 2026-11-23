@@ -6,7 +6,7 @@ set -eu
 REPO="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 PORT="${2:-8787}"
 TOOLS_ARGS=""; [ -n "${3:-}" ] && TOOLS_ARGS="-tools $3"
-IMAGE='golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195'
+IMAGE='golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea'
 docker rm -f gf-playground >/dev/null 2>&1 || true
 MSYS_NO_PATHCONV=1 docker run -d --name gf-playground -p "127.0.0.1:$PORT:8787" \
   -v "$REPO:/src:ro" -w /src -v guardfil-gomod:/go/pkg/mod -v guardfil-gocache:/root/.cache/go-build \

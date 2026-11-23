@@ -57,7 +57,7 @@ export GOSUMDB=off
 export GONOSUMDB='*'
 raw_go_version=$(go version)
 test -n "$raw_go_version"
-test "$(printf '%s\n' "$raw_go_version" | awk '{print $3}')" = go1.27.1
+test "$(printf '%s\n' "$raw_go_version" | awk '{print $3}')" = go1.27.4
 git -C "$source_root" diff --quiet
 git -C "$source_root" diff --cached --quiet
 go -C "$source_root" mod verify

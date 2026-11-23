@@ -187,7 +187,7 @@ const askShell = (cmd = "echo SECRET-CMD") => askRequest({ kind: "shell", comman
   step("phone shows rule Delete buttons", await p2.locator("#rules button", { hasText: "Delete" }).first().isVisible());
   await p2.screenshot({ path: out + "/04-phone-dark.png", fullPage: true });
 
-  // M4 content rules: add a block list in the Content tab; the next decision follows it.
+  // Content rules: add a block list in the Content tab; the next decision follows it.
   const before = await askShell("echo ZZ-12");
   step("shell allowed before the content list", before.effect === "ALLOW", before.effect);
   await page.click("#tab-content-btn");

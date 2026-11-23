@@ -55,7 +55,7 @@ if str(REPO_ROOT) not in sys.path:
 from deployments.local.agent_session import AgentSession, host_path, read_approver_socket  # noqa: E402
 from deployments.local.executor import AgentSpec, Executor, Mount, RelaySpec  # noqa: E402
 from deployments.local.runtime_cleanup import cleanup_after_error, finish_cli_cleanup, stop_session  # noqa: E402
-IMAGE_PIN = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+IMAGE_PIN = "golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 # Codex's standalone release folder (holds the codex binary); CODEX_BIN_DIR overrides.
 CODEX_BIN_DIR = os.environ.get("CODEX_BIN_DIR") or str(
     Path.home() / ".codex/packages/standalone/releases/0.166.0-x86_64-unknown-linux-musl/bin")
@@ -511,7 +511,7 @@ class Session:
 
 
 def run_turns(app: AppServer, prompts: Callable[[], Optional[str]], out: Callable[[str], None],
-              model: str = MODEL) -> int:
+              model: str = MODEL, *, once: bool = False) -> int:
     app.wait(app.request("initialize", {"clientInfo": {"name": "guardfil-run-codex", "version": "1"},
                                          "capabilities": {"experimentalApi": True}}), RPC_TIMEOUT_SEC)
     app.send({"jsonrpc": "2.0", "method": "initialized"})
@@ -532,7 +532,10 @@ def run_turns(app: AppServer, prompts: Callable[[], Optional[str]], out: Callabl
             "sandboxPolicy": {"type": "externalSandbox", "networkAccess": "restricted"}}), RPC_TIMEOUT_SEC)
         done = app.wait(None, TURN_IDLE_TIMEOUT_SEC)
         turns += 1
-        out(f"[turn {turns} {done['status']}]")
+        status = done["status"]
+        out(f"[turn {turns} {status}]")
+        if once and status != "completed":
+            raise RunError(f"Codex turn {turns} ended with status {status}")
 
 
 def interactive_prompts(first: Optional[str], once: bool) -> Callable[[], Optional[str]]:
@@ -627,7 +630,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     status = 1
     try:
         app = session.start()
-        turns = run_turns(app, interactive_prompts(a.prompt, a.once), session.out, a.model)
+        turns = run_turns(app, interactive_prompts(a.prompt, a.once), session.out, a.model, once=a.once)
         print(f"done: {turns} turn(s); decisions are in {session.gf_home}/state/decisions.jsonl")
         status = 0
     except KeyboardInterrupt:

@@ -2,12 +2,15 @@ package budget
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -16,13 +19,27 @@ import (
 )
 
 type MigrationTombstone struct {
-	SchemaVersion    int    `json:"schema_version"`
-	Mode             string `json:"mode"`
-	MigratedAtUTC    string `json:"migrated_at_utc"`
-	FromExperimentID string `json:"from_experiment_id"`
-	ToExperimentID   string `json:"to_experiment_id"`
-	LegacyDir        string `json:"legacy_dir"`
-	TargetDir        string `json:"target_dir"`
+	SchemaVersion      int    `json:"schema_version"`
+	Mode               string `json:"mode"`
+	MigratedAtUTC      string `json:"migrated_at_utc"`
+	TargetCreatedAtUTC string `json:"target_created_at_utc,omitempty"`
+	FromExperimentID   string `json:"from_experiment_id"`
+	ToExperimentID     string `json:"to_experiment_id"`
+	LegacyDir          string `json:"legacy_dir"`
+	TargetDir          string `json:"target_dir"`
+}
+
+type MigrationIntent struct {
+	SchemaVersion       int    `json:"schema_version"`
+	Mode                string `json:"mode"`
+	TargetCreatedAtUTC  string `json:"target_created_at_utc"`
+	StageDirName        string `json:"stage_dir_name"`
+	FromExperimentID    string `json:"from_experiment_id"`
+	ToExperimentID      string `json:"to_experiment_id"`
+	LegacyDir           string `json:"legacy_dir"`
+	TargetDir           string `json:"target_dir"`
+	EvidenceCount       int    `json:"evidence_count"`
+	EvidenceNamesDigest string `json:"evidence_names_digest"`
 }
 
 type MigrationResult struct {
@@ -42,18 +59,21 @@ type migrateFaultStep int
 
 const (
 	faultNone migrateFaultStep = iota
+	faultBeforeIntentPublish
+	faultAfterIntentWrite
 	faultAfterTargetRename
 	faultAfterTombstoneWrite
 )
 
-var expectedTombstoneKeys = map[string]bool{
-	"schema_version":     true,
-	"mode":               true,
-	"migrated_at_utc":    true,
-	"from_experiment_id": true,
-	"to_experiment_id":   true,
-	"legacy_dir":         true,
-	"target_dir":         true,
+var tombstoneTempName = regexp.MustCompile(`^\.tmp_tomb_[0-9a-f]{32}$`)
+var stageNameSuffix = regexp.MustCompile(`^[1-9][0-9]*-[0-9a-f]{16}$`)
+
+func computeEvidenceNamesDigest(names []string) string {
+	h := sha256.New()
+	for _, name := range names {
+		_, _ = fmt.Fprintf(h, "%d:%s\n", len(name), name)
+	}
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))
 }
 
 func checkDirPath(path string) error {
@@ -72,7 +92,7 @@ func checkDirPath(path string) error {
 }
 
 func checkRegularFile(path string) error {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return ErrLedgerNotFound
@@ -84,6 +104,31 @@ func checkRegularFile(path string) error {
 	}
 	defer syscall.Close(fd)
 	return checkDescriptor(fd, false)
+}
+
+func verifyRegularWitnessFile(path string) error {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return ErrLedgerNotFound
+		}
+		if errors.Is(err, syscall.ELOOP) {
+			return fmt.Errorf("%w: symlink detected on %s", ErrLedgerSecurity, path)
+		}
+		return fmt.Errorf("%w: cannot open witness file %s: %v", ErrLedgerSecurity, path, err)
+	}
+	defer syscall.Close(fd)
+	if err := checkDescriptor(fd, false); err != nil {
+		return err
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return fmt.Errorf("%w: fstat %s failed: %v", ErrLedgerCorrupt, path, err)
+	}
+	if st.Size > MaxStateFileBytes {
+		return fmt.Errorf("%w: %s exceeds maximum witness file size", ErrLedgerCorrupt, path)
+	}
+	return nil
 }
 
 func fsyncDirPath(path string) error {
@@ -107,7 +152,7 @@ func isEvidenceFilename(name string) bool {
 }
 
 func verifyOneEvidenceFile(path string) error {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("%w: %w: symlink detected on %s", ErrEvidenceCopy, ErrLedgerSecurity, path)
@@ -149,9 +194,78 @@ func verifyEvidenceFilesReadOnly(legacyRoot string) ([]string, error) {
 	return names, nil
 }
 
+func verifiedFilesEqual(srcPath, dstPath string, maxBytes int64) error {
+	srcFD, err := syscall.Open(srcPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("%w: cannot open %s: %v", ErrLedgerSecurity, srcPath, err)
+	}
+	defer syscall.Close(srcFD)
+	if err := checkDescriptor(srcFD, false); err != nil {
+		return err
+	}
+	var srcSt syscall.Stat_t
+	if err := syscall.Fstat(srcFD, &srcSt); err != nil {
+		return fmt.Errorf("%w: fstat %s: %v", ErrLedgerCorrupt, srcPath, err)
+	}
+
+	dstFD, err := syscall.Open(dstPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("%w: cannot open %s: %v", ErrLedgerSecurity, dstPath, err)
+	}
+	defer syscall.Close(dstFD)
+	if err := checkDescriptor(dstFD, false); err != nil {
+		return err
+	}
+	var dstSt syscall.Stat_t
+	if err := syscall.Fstat(dstFD, &dstSt); err != nil {
+		return fmt.Errorf("%w: fstat %s: %v", ErrLedgerCorrupt, dstPath, err)
+	}
+
+	if srcSt.Size > maxBytes || dstSt.Size > maxBytes || srcSt.Size != dstSt.Size {
+		return fmt.Errorf("%w: %w: file size mismatch between %s (%d) and %s (%d)", ErrLedgerCorrupt, ErrMigrationState, srcPath, srcSt.Size, dstPath, dstSt.Size)
+	}
+
+	srcBuf := make([]byte, 64*1024)
+	dstBuf := make([]byte, 64*1024)
+	var compared int64
+	for compared < srcSt.Size {
+		want := len(srcBuf)
+		if rem := int(srcSt.Size - compared); rem < want {
+			want = rem
+		}
+		n1, err1 := readFullFD(srcFD, srcBuf[:want])
+		n2, err2 := readFullFD(dstFD, dstBuf[:want])
+		if err1 != nil || err2 != nil || n1 != want || n2 != want {
+			return fmt.Errorf("%w: %w: read compare failed between %s and %s", ErrLedgerCorrupt, ErrMigrationState, srcPath, dstPath)
+		}
+		if !bytes.Equal(srcBuf[:want], dstBuf[:want]) {
+			return fmt.Errorf("%w: %w: file content mismatch between %s and %s", ErrLedgerCorrupt, ErrMigrationState, srcPath, dstPath)
+		}
+		compared += int64(want)
+	}
+	return nil
+}
+
+func readFullFD(fd int, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		n, err := syscall.Read(fd, buf[total:])
+		if n > 0 {
+			total += n
+		}
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			break
+		}
+	}
+	return total, nil
+}
+
 func copyVerifiedRegularFile(srcDir, dstDir, name string) error {
 	srcPath := filepath.Join(srcDir, name)
-	srcFD, err := syscall.Open(srcPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	srcFD, err := syscall.Open(srcPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("%w: symlink detected on %s", ErrLedgerSecurity, srcPath)
@@ -203,7 +317,7 @@ func copyVerifiedRegularFile(srcDir, dstDir, name string) error {
 
 func copyVerifiedEvidenceFile(srcDir, dstDir, name string) error {
 	srcPath := filepath.Join(srcDir, name)
-	srcFD, err := syscall.Open(srcPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	srcFD, err := syscall.Open(srcPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ELOOP) {
 			return fmt.Errorf("%w: %w: symlink detected on %s", ErrEvidenceCopy, ErrLedgerSecurity, srcPath)
@@ -263,67 +377,17 @@ func copyVerifiedEvidenceFile(srcDir, dstDir, name string) error {
 }
 
 func validateTombstone(legacyRoot string, spec ProviderLedgerSpec) (*MigrationTombstone, error) {
-	tombPath := filepath.Join(legacyRoot, TombstoneFilename)
-	fd, err := syscall.Open(tombPath, syscall.O_RDONLY|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	m, err := readMigrationRecord(filepath.Join(legacyRoot, TombstoneFilename))
 	if err != nil {
-		if errors.Is(err, syscall.ENOENT) {
-			return nil, ErrLedgerNotFound
-		}
-		if errors.Is(err, syscall.ELOOP) {
-			return nil, fmt.Errorf("%w: %w: tombstone is a symlink", ErrMigrationState, ErrLedgerSecurity)
-		}
-		return nil, fmt.Errorf("%w: %w: cannot open tombstone: %v", ErrMigrationState, ErrLedgerSecurity, err)
+		return nil, err
 	}
-	defer syscall.Close(fd)
-
-	if err := checkDescriptor(fd, false); err != nil {
+	keys := []string{"schema_version", "mode", "migrated_at_utc", "from_experiment_id", "to_experiment_id", "legacy_dir", "target_dir"}
+	if _, present := m["target_created_at_utc"]; present {
+		keys = append(keys, "target_created_at_utc")
+	}
+	if err := checkClosedSchema(m, keys, "tombstone"); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
 	}
-	var st syscall.Stat_t
-	if err := syscall.Fstat(fd, &st); err != nil {
-		return nil, fmt.Errorf("%w: %w: fstat tombstone failed: %v", ErrLedgerCorrupt, ErrMigrationState, err)
-	}
-	if st.Size > 64*1024 {
-		return nil, fmt.Errorf("%w: %w: tombstone too large", ErrLedgerCorrupt, ErrMigrationState)
-	}
-	data := make([]byte, st.Size)
-	total := 0
-	for total < len(data) {
-		n, rerr := syscall.Read(fd, data[total:])
-		if rerr != nil {
-			return nil, fmt.Errorf("%w: %w: read tombstone failed: %v", ErrLedgerCorrupt, ErrMigrationState, rerr)
-		}
-		if n == 0 {
-			break
-		}
-		total += n
-	}
-	data = data[:total]
-	val, err := safeJSONDecode(data)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
-	}
-	m, ok := val.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("%w: %w: tombstone must be a JSON object", ErrLedgerCorrupt, ErrMigrationState)
-	}
-	var missing, unexpected []string
-	for k := range expectedTombstoneKeys {
-		if _, exists := m[k]; !exists {
-			missing = append(missing, k)
-		}
-	}
-	for k := range m {
-		if !expectedTombstoneKeys[k] {
-			unexpected = append(unexpected, k)
-		}
-	}
-	if len(missing) > 0 || len(unexpected) > 0 {
-		sort.Strings(missing)
-		sort.Strings(unexpected)
-		return nil, fmt.Errorf("%w: %w: tombstone closed schema violation: missing=%v unexpected=%v", ErrLedgerCorrupt, ErrMigrationState, missing, unexpected)
-	}
-
 	v2 := SchemaVersionV2
 	sv, err := validateInt(m["schema_version"], "schema_version", v2, &v2)
 	if err != nil {
@@ -336,6 +400,16 @@ func validateTombstone(legacyRoot string, spec ProviderLedgerSpec) (*MigrationTo
 	ts, _, err := validateTimestamp(m["migrated_at_utc"])
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	var targetCreatedAt string
+	if rawTargetCreated, hasTargetCreated := m["target_created_at_utc"]; hasTargetCreated {
+		if mode != TombstoneModeFreshV2 {
+			return nil, fmt.Errorf("%w: %w: target_created_at_utc only permitted on fresh_v2 tombstone", ErrLedgerCorrupt, ErrMigrationState)
+		}
+		targetCreatedAt, _, err = validateTimestamp(rawTargetCreated)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+		}
 	}
 	fromID, err := validateIdentifier(m["from_experiment_id"], "from_experiment_id")
 	if err != nil {
@@ -357,68 +431,411 @@ func validateTombstone(legacyRoot string, spec ProviderLedgerSpec) (*MigrationTo
 		return nil, fmt.Errorf("%w: %w: tombstone identity mismatch for %s", ErrLedgerCorrupt, ErrMigrationState, spec.Provider)
 	}
 	return &MigrationTombstone{
-		SchemaVersion:    sv,
-		Mode:             mode,
-		MigratedAtUTC:    ts,
-		FromExperimentID: fromID,
-		ToExperimentID:   toID,
-		LegacyDir:        legDir,
-		TargetDir:        tgtDir,
+		SchemaVersion:      sv,
+		Mode:               mode,
+		MigratedAtUTC:      ts,
+		TargetCreatedAtUTC: targetCreatedAt,
+		FromExperimentID:   fromID,
+		ToExperimentID:     toID,
+		LegacyDir:          legDir,
+		TargetDir:          tgtDir,
 	}, nil
 }
 
-func publishTombstone(legacyRoot string, spec ProviderLedgerSpec, mode string, timestampUTC string) error {
+func publishTombstone(legacyRoot string, spec ProviderLedgerSpec, mode string, timestampUTC string, targetCreatedAtUTC string) error {
 	tomb := MigrationTombstone{
-		SchemaVersion:    SchemaVersionV2,
-		Mode:             mode,
-		MigratedAtUTC:    timestampUTC,
-		FromExperimentID: spec.LegacyID,
-		ToExperimentID:   spec.TargetID,
-		LegacyDir:        spec.LegacyDir,
-		TargetDir:        spec.TargetDir,
+		SchemaVersion:      SchemaVersionV2,
+		Mode:               mode,
+		MigratedAtUTC:      timestampUTC,
+		TargetCreatedAtUTC: targetCreatedAtUTC,
+		FromExperimentID:   spec.LegacyID,
+		ToExperimentID:     spec.TargetID,
+		LegacyDir:          spec.LegacyDir,
+		TargetDir:          spec.TargetDir,
 	}
 	tombEnc, _ := json.MarshalIndent(tomb, "", "  ")
 	return publishBytes(defaultFS, legacyRoot, TombstoneFilename, ".tmp_tomb_", tombEnc)
 }
 
-func installFreshV2LegacySentinel(absRoot, legacyRoot string, spec ProviderLedgerSpec) error {
-	stageName := fmt.Sprintf(".sentinel-%s-%d-%s", spec.Provider, os.Getpid(), randomHex(8))
-	stageDir := filepath.Join(absRoot, stageName)
-	stageLedgerDir := filepath.Join(stageDir, "ledger")
-	if err := os.MkdirAll(stageLedgerDir, 0700); err != nil {
-		return fmt.Errorf("%w: cannot create legacy sentinel stage dir: %v", ErrLedgerSecurity, err)
+func readMigrationRecord(path string) (map[string]any, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if errors.Is(err, syscall.ENOENT) {
+		return nil, ErrLedgerNotFound
 	}
-	_ = os.Chmod(stageDir, 0700)
-	_ = os.Chmod(stageLedgerDir, 0700)
-	published := false
-	defer func() {
-		if !published {
-			_ = os.RemoveAll(stageDir)
-		}
-	}()
-
-	lockPath := filepath.Join(stageLedgerDir, LockFilename)
-	lockFD, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
-		return fmt.Errorf("%w: create legacy sentinel lock: %v", ErrLedgerSecurity, err)
+		return nil, fmt.Errorf("%w: %w: open %s: %v", ErrMigrationState, ErrLedgerSecurity, path, err)
 	}
-	_ = syscall.Fsync(lockFD)
-	_ = syscall.Close(lockFD)
+	defer syscall.Close(fd)
+	if err := checkDescriptor(fd, false); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return nil, fmt.Errorf("%w: %w: stat %s: %v", ErrLedgerCorrupt, ErrMigrationState, path, err)
+	}
+	if st.Size > 64*1024 {
+		return nil, fmt.Errorf("%w: %w: %s exceeds 64 KiB", ErrLedgerCorrupt, ErrMigrationState, path)
+	}
+	data := make([]byte, st.Size)
+	n, err := readFullFD(fd, data)
+	if err != nil || n != len(data) {
+		return nil, fmt.Errorf("%w: %w: incomplete migration record %s", ErrLedgerCorrupt, ErrMigrationState, path)
+	}
+	val, err := safeJSONDecode(data)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	record, ok := val.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("%w: %w: %s must contain a JSON object", ErrLedgerCorrupt, ErrMigrationState, path)
+	}
+	return record, nil
+}
 
-	if err := publishTombstone(stageDir, spec, TombstoneModeFreshV2, nowUTCStr()); err != nil {
+func validateMigrationIntent(legacyLedgerDir string, spec ProviderLedgerSpec) (*MigrationIntent, error) {
+	m, err := readMigrationRecord(filepath.Join(legacyLedgerDir, MigrationIntentFilename))
+	if err != nil {
+		return nil, err
+	}
+	keys := []string{"schema_version", "mode", "target_created_at_utc", "stage_dir_name", "from_experiment_id", "to_experiment_id", "legacy_dir", "target_dir", "evidence_count", "evidence_names_digest"}
+	if err := checkClosedSchema(m, keys, "migration intent"); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	v2 := SchemaVersionV2
+	sv, err := validateInt(m["schema_version"], "schema_version", v2, &v2)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	mode, ok := m["mode"].(string)
+	if !ok || (mode != IntentModeFreshInit && mode != IntentModeRetireEmpty) {
+		return nil, fmt.Errorf("%w: %w: migration intent mode invalid", ErrLedgerCorrupt, ErrMigrationState)
+	}
+	targetCreatedAt, _, err := validateTimestamp(m["target_created_at_utc"])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	stageDirName, err := validateIdentifier(m["stage_dir_name"], "stage_dir_name")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	prefix := ".init-" + spec.Provider + "-"
+	if mode == IntentModeRetireEmpty {
+		prefix = ".retire-" + spec.Provider + "-"
+	}
+	suffix, matched := strings.CutPrefix(stageDirName, prefix)
+	if !matched || !stageNameSuffix.MatchString(suffix) {
+		return nil, fmt.Errorf("%w: %w: invalid stage_dir_name %q", ErrLedgerCorrupt, ErrMigrationState, stageDirName)
+	}
+	fromID, err := validateIdentifier(m["from_experiment_id"], "from_experiment_id")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	toID, err := validateIdentifier(m["to_experiment_id"], "to_experiment_id")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	legDir, err := validateIdentifier(m["legacy_dir"], "legacy_dir")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	tgtDir, err := validateIdentifier(m["target_dir"], "target_dir")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	if fromID != spec.LegacyID || toID != spec.TargetID || legDir != spec.LegacyDir || tgtDir != spec.TargetDir {
+		return nil, fmt.Errorf("%w: %w: migration intent identity mismatch for %s", ErrLedgerCorrupt, ErrMigrationState, spec.Provider)
+	}
+	evCount, err := validateInt(m["evidence_count"], "evidence_count", 0, nil)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	evDigest, err := validateDigest(m["evidence_names_digest"])
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	if !strings.HasPrefix(evDigest, "sha256:") || len(evDigest) != len("sha256:")+64 {
+		return nil, fmt.Errorf("%w: %w: invalid evidence_names_digest format", ErrLedgerCorrupt, ErrMigrationState)
+	}
+	if _, err := hex.DecodeString(evDigest[len("sha256:"):]); err != nil {
+		return nil, fmt.Errorf("%w: %w: invalid evidence_names_digest hex", ErrLedgerCorrupt, ErrMigrationState)
+	}
+	emptyDigest := computeEvidenceNamesDigest(nil)
+	if mode == IntentModeFreshInit && (evCount != 0 || evDigest != emptyDigest) {
+		return nil, fmt.Errorf("%w: %w: fresh_init migration intent cannot carry evidence files", ErrLedgerCorrupt, ErrMigrationState)
+	}
+	if (evCount == 0) != (evDigest == emptyDigest) {
+		return nil, fmt.Errorf("%w: %w: migration intent evidence_count and evidence_names_digest inconsistent", ErrLedgerCorrupt, ErrMigrationState)
+	}
+	return &MigrationIntent{
+		SchemaVersion:       sv,
+		Mode:                mode,
+		TargetCreatedAtUTC:  targetCreatedAt,
+		StageDirName:        stageDirName,
+		FromExperimentID:    fromID,
+		ToExperimentID:      toID,
+		LegacyDir:           legDir,
+		TargetDir:           tgtDir,
+		EvidenceCount:       evCount,
+		EvidenceNamesDigest: evDigest,
+	}, nil
+}
+
+func publishMigrationIntent(legacyLedgerDir string, intent *MigrationIntent) error {
+	enc, err := json.MarshalIndent(intent, "", "  ")
+	if err != nil {
 		return err
 	}
-	if err := fsyncDirPath(stageLedgerDir); err != nil {
-		return err
+	return publishBytes(defaultFS, legacyLedgerDir, MigrationIntentFilename, ".tmp_mintent_", enc)
+}
+
+func lockLegacyScaffold(legacyLedgerDir string) (func(), error) {
+	if err := checkDirPath(legacyLedgerDir); err != nil {
+		return nil, fmt.Errorf("%w: %w: invalid legacy ledger directory: %w", ErrLedgerCorrupt, ErrMigrationState, err)
 	}
-	if err := fsyncDirPath(stageDir); err != nil {
-		return err
+	lockPath := filepath.Join(legacyLedgerDir, LockFilename)
+	lockFD, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ENOENT) {
+			return nil, ErrLedgerNotFound
+		}
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, fmt.Errorf("%w: %w: symlink detected on legacy lock %s", ErrLedgerSecurity, ErrMigrationState, lockPath)
+		}
+		return nil, fmt.Errorf("%w: %w: cannot open legacy lock %s: %v", ErrLedgerSecurity, ErrMigrationState, lockPath, err)
 	}
-	if err := unix.Renameat2(unix.AT_FDCWD, stageDir, unix.AT_FDCWD, legacyRoot, unix.RENAME_NOREPLACE); err != nil {
-		return fmt.Errorf("%w: publish legacy v2 sentinel failed: %v", ErrMigrationState, err)
+	if err := checkDescriptor(lockFD, false); err != nil {
+		_ = syscall.Close(lockFD)
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
 	}
-	published = true
-	return fsyncDirPath(absRoot)
+	if err := syscall.Flock(lockFD, syscall.LOCK_EX); err != nil {
+		_ = syscall.Close(lockFD)
+		return nil, fmt.Errorf("lock legacy scaffold: %w", err)
+	}
+	return func() {
+		_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+		_ = syscall.Close(lockFD)
+	}, nil
+}
+
+func verifyLegacyScaffoldDuringIntent(legacyRoot, legacyLedgerDir string, intent *MigrationIntent, spec ProviderLedgerSpec) (*MigrationTombstone, []string, error) {
+	if err := checkDirPath(legacyRoot); err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	if err := checkDirPath(legacyLedgerDir); err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	if err := checkRegularFile(filepath.Join(legacyLedgerDir, LockFilename)); err != nil {
+		return nil, nil, fmt.Errorf("%w: %w: legacy lock invalid during intent: %w", ErrLedgerCorrupt, ErrMigrationState, err)
+	}
+	legEntries, err := os.ReadDir(legacyLedgerDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w: cannot read legacy ledger dir: %v", ErrLedgerSecurity, ErrMigrationState, err)
+	}
+	for _, de := range legEntries {
+		name := de.Name()
+		if name != LockFilename && name != MigrationIntentFilename {
+			return nil, nil, fmt.Errorf("%w: %w: unexpected file %s in legacy ledger dir during %s", ErrLedgerCorrupt, ErrMigrationState, name, intent.Mode)
+		}
+	}
+
+	evOnDisk, err := verifyEvidenceFilesReadOnly(legacyRoot)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(evOnDisk) != intent.EvidenceCount || computeEvidenceNamesDigest(evOnDisk) != intent.EvidenceNamesDigest {
+		return nil, nil, fmt.Errorf("%w: %w: legacy evidence file set changed during %s", ErrLedgerCorrupt, ErrMigrationState, intent.Mode)
+	}
+
+	expectedRootEntries := make(map[string]bool, len(evOnDisk)+2)
+	expectedRootEntries["ledger"] = true
+	for _, ev := range evOnDisk {
+		expectedRootEntries[ev] = true
+	}
+
+	rootEntries, err := os.ReadDir(legacyRoot)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w: cannot read legacy root: %v", ErrLedgerSecurity, ErrMigrationState, err)
+	}
+	hasTombstone := false
+	for _, de := range rootEntries {
+		name := de.Name()
+		if name == TombstoneFilename {
+			hasTombstone = true
+			continue
+		}
+		if tombstoneTempName.MatchString(name) {
+			if err := checkRegularFile(filepath.Join(legacyRoot, name)); err != nil {
+				return nil, nil, fmt.Errorf("%w: %w: invalid temporary tombstone %s: %w", ErrLedgerCorrupt, ErrMigrationState, name, err)
+			}
+			continue
+		}
+		if !expectedRootEntries[name] {
+			return nil, nil, fmt.Errorf("%w: %w: unexpected file %s in legacy root during %s", ErrLedgerCorrupt, ErrMigrationState, name, intent.Mode)
+		}
+	}
+	if !hasTombstone {
+		return nil, evOnDisk, nil
+	}
+	tomb, err := validateTombstone(legacyRoot, spec)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tomb.Mode != TombstoneModeFreshV2 || tomb.TargetCreatedAtUTC != intent.TargetCreatedAtUTC {
+		return nil, nil, fmt.Errorf("%w: %w: tombstone provenance mismatch with migration intent", ErrLedgerCorrupt, ErrMigrationState)
+	}
+	return tomb, evOnDisk, nil
+}
+
+func cleanupStaleTombstoneTemps(legacyRoot string) error {
+	entries, err := os.ReadDir(legacyRoot)
+	if err != nil {
+		return fmt.Errorf("%w: %w: cannot read legacy root %s: %v", ErrLedgerSecurity, ErrMigrationState, legacyRoot, err)
+	}
+	for _, de := range entries {
+		name := de.Name()
+		if !tombstoneTempName.MatchString(name) {
+			continue
+		}
+		p := filepath.Join(legacyRoot, name)
+		if err := checkRegularFile(p); err != nil {
+			return fmt.Errorf("%w: %w: invalid temporary tombstone %s: %w", ErrLedgerCorrupt, ErrMigrationState, name, err)
+		}
+		if err := os.Remove(p); err != nil {
+			return fmt.Errorf("remove stale temporary tombstone %s: %w", p, err)
+		}
+	}
+	return nil
+}
+
+func verifyStagedOrTargetFreshV2Dir(dir string, legacyRoot string, intent *MigrationIntent, evidenceFiles []string, spec ProviderLedgerSpec) (*LedgerState, error) {
+	if err := checkDirPath(dir); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	ledgerDir := filepath.Join(dir, "ledger")
+	if err := checkDirPath(ledgerDir); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrMigrationState, err)
+	}
+	st, err := inspectTargetLedgerReadOnly(ledgerDir, spec.TargetID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w: %w", ErrLedgerCorrupt, ErrMigrationState, err)
+	}
+	if st.SchemaVersion != SchemaVersionV2 || st.ExperimentID != spec.TargetID || st.LegacyExperimentID != "" || migratedInspectionGen(st) != 0 {
+		return nil, fmt.Errorf("%w: %w: target metadata invalid for %s intent", ErrLedgerCorrupt, ErrMigrationState, intent.Mode)
+	}
+	if st.CreatedAtUTC != intent.TargetCreatedAtUTC {
+		return nil, fmt.Errorf("%w: %w: target created_at_utc %q != intent provenance %q", ErrLedgerCorrupt, ErrMigrationState, st.CreatedAtUTC, intent.TargetCreatedAtUTC)
+	}
+	if len(st.Journal) != 1 || st.Journal[0].EntryType != "INITIALIZED" || st.Journal[0].TimestampUTC != intent.TargetCreatedAtUTC ||
+		st.TotalReservationsCount != 0 || st.SettledRequestsCount != 0 ||
+		st.CommittedSpendMicros != 0 || st.RetainedFailedMicros != 0 ||
+		st.Halted || st.PendingReservation != nil {
+		return nil, fmt.Errorf("%w: %w: target state is not a clean fresh v2 ledger matching intent", ErrLedgerCorrupt, ErrMigrationState)
+	}
+
+	expectedEntries := make(map[string]bool, len(evidenceFiles)+1)
+	expectedEntries["ledger"] = true
+	for _, ev := range evidenceFiles {
+		expectedEntries[ev] = true
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w: cannot read target dir %s: %v", ErrLedgerSecurity, ErrMigrationState, dir, err)
+	}
+	if len(entries) != len(expectedEntries) {
+		return nil, fmt.Errorf("%w: %w: target directory %s entry count (%d) != expected (%d)", ErrLedgerCorrupt, ErrMigrationState, dir, len(entries), len(expectedEntries))
+	}
+	for _, de := range entries {
+		if !expectedEntries[de.Name()] {
+			return nil, fmt.Errorf("%w: %w: unexpected file %s in target directory %s", ErrLedgerCorrupt, ErrMigrationState, de.Name(), dir)
+		}
+	}
+	for _, ev := range evidenceFiles {
+		dstEv := filepath.Join(dir, ev)
+		if err := verifyOneEvidenceFile(dstEv); err != nil {
+			return nil, fmt.Errorf("%w: %w: %w", ErrLedgerCorrupt, ErrMigrationState, err)
+		}
+		srcEv := filepath.Join(legacyRoot, ev)
+		if err := verifiedFilesEqual(srcEv, dstEv, MaxEvidenceFileBytes); err != nil {
+			return nil, err
+		}
+	}
+	return st, nil
+}
+
+func resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot string, spec ProviderLedgerSpec, intent *MigrationIntent, evidenceFiles []string, existingTomb *MigrationTombstone, dryRun bool, faultAfter migrateFaultStep) (*LedgerState, error) {
+	stageDir := filepath.Join(absRoot, intent.StageDirName)
+	_, stageErr := os.Lstat(stageDir)
+	stageExists := stageErr == nil
+	if stageErr != nil && !os.IsNotExist(stageErr) {
+		return nil, fmt.Errorf("%w: cannot stat staged target %s: %v", ErrLedgerSecurity, stageDir, stageErr)
+	}
+	_, tgtErr := os.Lstat(targetRoot)
+	targetExists := tgtErr == nil
+	if tgtErr != nil && !os.IsNotExist(tgtErr) {
+		return nil, fmt.Errorf("%w: cannot stat target root %s: %v", ErrLedgerSecurity, targetRoot, tgtErr)
+	}
+
+	if stageExists && targetExists {
+		return nil, fmt.Errorf("%w: %w: both staged target %s and target %s exist during %s", ErrLedgerCorrupt, ErrMigrationState, stageDir, targetRoot, intent.Mode)
+	}
+	if !stageExists && !targetExists {
+		return nil, fmt.Errorf("%w: %w: target directory %s is missing for in-progress %s", ErrLedgerCorrupt, ErrMigrationState, targetRoot, intent.Mode)
+	}
+	if stageExists && existingTomb != nil {
+		return nil, fmt.Errorf("%w: %w: tombstone already exists while target remains unpromoted at %s", ErrLedgerCorrupt, ErrMigrationState, stageDir)
+	}
+
+	var st *LedgerState
+	var err error
+	if stageExists {
+		st, err = verifyStagedOrTargetFreshV2Dir(stageDir, legacyRoot, intent, evidenceFiles, spec)
+		if err != nil {
+			return nil, err
+		}
+		if dryRun {
+			return st, nil
+		}
+		if err := unix.Renameat2(unix.AT_FDCWD, stageDir, unix.AT_FDCWD, targetRoot, unix.RENAME_NOREPLACE); err != nil {
+			return nil, fmt.Errorf("%w: %w: atomic target directory publish failed: %v", ErrLedgerCorrupt, ErrMigrationState, err)
+		}
+		if err := fsyncDirPath(absRoot); err != nil {
+			return nil, err
+		}
+		if faultAfter == faultAfterTargetRename {
+			return nil, errors.New("injected fault after target directory publish")
+		}
+	} else {
+		st, err = verifyStagedOrTargetFreshV2Dir(targetRoot, legacyRoot, intent, evidenceFiles, spec)
+		if err != nil {
+			return nil, err
+		}
+		if dryRun {
+			return st, nil
+		}
+	}
+
+	if err := cleanupStaleTombstoneTemps(legacyRoot); err != nil {
+		return nil, err
+	}
+	if existingTomb == nil {
+		if err := publishTombstone(legacyRoot, spec, TombstoneModeFreshV2, nowUTCStr(), intent.TargetCreatedAtUTC); err != nil {
+			return nil, err
+		}
+		if err := fsyncDirPath(legacyRoot); err != nil {
+			return nil, err
+		}
+		if faultAfter == faultAfterTombstoneWrite {
+			return nil, errors.New("injected fault after tombstone write")
+		}
+	}
+
+	if err := os.Remove(filepath.Join(legacyLedgerDir, MigrationIntentFilename)); err != nil {
+		return nil, fmt.Errorf("remove migration intent: %w", err)
+	}
+	if err := fsyncDirPath(legacyLedgerDir); err != nil {
+		return nil, err
+	}
+	return st, nil
 }
 
 func verifyRetiredLegacyScaffold(legacyRoot string, spec ProviderLedgerSpec) (*MigrationTombstone, *LedgerState, error) {
@@ -480,6 +897,20 @@ func verifyTargetProvenance(targetState *LedgerState, tomb *MigrationTombstone, 
 	if tomb.Mode == TombstoneModeFreshV2 {
 		if targetState.LegacyExperimentID != "" || migratedInspectionGen(targetState) != 0 {
 			return fmt.Errorf("%w: %w: target ledger carries unexpected migration metadata for fresh_v2 scaffold", ErrLedgerCorrupt, ErrMigrationState)
+		}
+		if len(targetState.Journal) == 0 || targetState.Journal[0].EntryType != "INITIALIZED" || targetState.Journal[0].TimestampUTC != targetState.CreatedAtUTC {
+			return fmt.Errorf("%w: %w: target ledger INITIALIZED entry timestamp mismatch for fresh_v2 scaffold", ErrLedgerCorrupt, ErrMigrationState)
+		}
+		if tomb.TargetCreatedAtUTC != "" {
+			if targetState.CreatedAtUTC != tomb.TargetCreatedAtUTC {
+				return fmt.Errorf("%w: %w: target created_at_utc %q != fresh_v2 tombstone provenance %q", ErrLedgerCorrupt, ErrMigrationState, targetState.CreatedAtUTC, tomb.TargetCreatedAtUTC)
+			}
+		} else {
+			_, dtTarget, err1 := validateTimestamp(targetState.CreatedAtUTC)
+			_, dtTomb, err2 := validateTimestamp(tomb.MigratedAtUTC)
+			if err1 != nil || err2 != nil || dtTarget.After(dtTomb) {
+				return fmt.Errorf("%w: %w: target created_at_utc %q postdates fresh_v2 tombstone %q", ErrLedgerCorrupt, ErrMigrationState, targetState.CreatedAtUTC, tomb.MigratedAtUTC)
+			}
 		}
 		return nil
 	}
@@ -576,6 +1007,10 @@ func classifyLegacyWithoutState(legacyRoot string) (bool, error) {
 // target exists and initialize is true), failing closed on unmigrated,
 // missing-scaffold, or provenance-mismatched state.
 func OpenProviderLedger(stateRoot string, provider string, initialize bool) (*BudgetLedger, error) {
+	return openProviderLedgerWithHook(stateRoot, provider, initialize, faultNone)
+}
+
+func openProviderLedgerWithHook(stateRoot string, provider string, initialize bool, faultAfter migrateFaultStep) (*BudgetLedger, error) {
 	spec, ok := ProviderLedgerSpecs[provider]
 	if !ok {
 		return nil, fmt.Errorf("unknown provider %q", provider)
@@ -585,6 +1020,7 @@ func OpenProviderLedger(stateRoot string, provider string, initialize bool) (*Bu
 		return nil, err
 	}
 	legacyRoot := filepath.Join(absRoot, spec.LegacyDir)
+	legacyLedgerDir := filepath.Join(legacyRoot, "ledger")
 	targetRoot := filepath.Join(absRoot, spec.TargetDir)
 	targetLedgerDir := filepath.Join(targetRoot, "ledger")
 
@@ -598,11 +1034,54 @@ func OpenProviderLedger(stateRoot string, provider string, initialize bool) (*Bu
 		if err := checkDirPath(legacyRoot); err != nil {
 			return nil, fmt.Errorf("%w: invalid legacy directory for %s: %v", ErrLedgerSecurity, provider, err)
 		}
-		legacyStatePath := filepath.Join(legacyRoot, "ledger", StateFilename)
+		legacyStatePath := filepath.Join(legacyLedgerDir, StateFilename)
 		if _, stErr := os.Lstat(legacyStatePath); stErr == nil {
 			return nil, fmt.Errorf("%w: legacy %s ledger at %s must be migrated first: run 'guardfil-broker migrate-ledger --provider %s'", ErrLedgerMigrationRequired, provider, legacyRoot, provider)
 		} else if !os.IsNotExist(stErr) {
 			return nil, fmt.Errorf("%w: %w: cannot stat legacy state %s: %v", ErrLedgerSecurity, ErrMigrationState, legacyStatePath, stErr)
+		}
+
+		var unlockScaffold func()
+		if _, lockStatErr := os.Lstat(filepath.Join(legacyLedgerDir, LockFilename)); lockStatErr == nil {
+			unlockScaffold, err = lockLegacyScaffold(legacyLedgerDir)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w: legacy %s lock invalid: %w", ErrLedgerCorrupt, ErrMigrationState, provider, err)
+			}
+			defer unlockScaffold()
+		} else if !os.IsNotExist(lockStatErr) {
+			return nil, fmt.Errorf("%w: %w: cannot stat legacy lock: %v", ErrLedgerSecurity, ErrMigrationState, lockStatErr)
+		}
+
+		intentPath := filepath.Join(legacyLedgerDir, MigrationIntentFilename)
+		if _, iErr := os.Lstat(intentPath); iErr == nil {
+			if unlockScaffold == nil {
+				return nil, fmt.Errorf("%w: %w: legacy %s migration intent present without lock file", ErrLedgerCorrupt, ErrMigrationState, provider)
+			}
+			intent, err := validateMigrationIntent(legacyLedgerDir, spec)
+			if err != nil {
+				return nil, err
+			}
+			existingTomb, evFiles, err := verifyLegacyScaffoldDuringIntent(legacyRoot, legacyLedgerDir, intent, spec)
+			if err != nil {
+				return nil, err
+			}
+			if intent.Mode == IntentModeRetireEmpty {
+				if _, err := resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot, spec, intent, evFiles, existingTomb, true, faultNone); err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("%w: unretired legacy %s directory at %s must be migrated first: run 'guardfil-broker migrate-ledger --provider %s'", ErrLedgerMigrationRequired, provider, legacyRoot, provider)
+			}
+			if !initialize {
+				if _, err := resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot, spec, intent, evFiles, existingTomb, true, faultNone); err != nil {
+					return nil, err
+				}
+				return nil, fmt.Errorf("%w: %w: fresh v2 initialization for %s is incomplete", ErrLedgerCorrupt, ErrMigrationState, provider)
+			}
+			if _, err := resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot, spec, intent, evFiles, existingTomb, false, faultAfter); err != nil {
+				return nil, err
+			}
+		} else if !os.IsNotExist(iErr) {
+			return nil, fmt.Errorf("%w: %w: cannot stat migration intent: %v", ErrLedgerSecurity, ErrMigrationState, iErr)
 		}
 
 		tomb, backupState, err = verifyRetiredLegacyScaffold(legacyRoot, spec)
@@ -610,11 +1089,16 @@ func OpenProviderLedger(stateRoot string, provider string, initialize bool) (*Bu
 			if errors.Is(err, ErrLedgerNotFound) {
 				_, tgtErr := os.Lstat(targetRoot)
 				emptyOK, cErr := classifyLegacyWithoutState(legacyRoot)
-				if os.IsNotExist(tgtErr) && cErr == nil && emptyOK {
-					return nil, fmt.Errorf("%w: unretired legacy %s directory at %s must be migrated first: run 'guardfil-broker migrate-ledger --provider %s'", ErrLedgerMigrationRequired, provider, legacyRoot, provider)
+				if cErr == nil && emptyOK {
+					if _, evErr := verifyEvidenceFilesReadOnly(legacyRoot); evErr != nil {
+						return nil, evErr
+					}
+					if os.IsNotExist(tgtErr) {
+						return nil, fmt.Errorf("%w: unretired legacy %s directory at %s must be migrated first: run 'guardfil-broker migrate-ledger --provider %s'", ErrLedgerMigrationRequired, provider, legacyRoot, provider)
+					}
 				}
 			}
-			return nil, fmt.Errorf("%w: %w: legacy %s retirement scaffold invalid: %v", ErrLedgerCorrupt, ErrMigrationState, provider, err)
+			return nil, fmt.Errorf("%w: %w: legacy %s retirement scaffold invalid: %w", ErrLedgerCorrupt, ErrMigrationState, provider, err)
 		}
 		legacyTombstoned = true
 	} else if !os.IsNotExist(lerr) {
@@ -651,7 +1135,7 @@ func OpenProviderLedger(stateRoot string, provider string, initialize bool) (*Bu
 		return nil, fmt.Errorf("%w: cannot stat target directory %s: %v", ErrLedgerSecurity, targetRoot, terr)
 	}
 
-	if legacyTombstoned {
+	if legacyTombstoned || legacyExists {
 		return nil, fmt.Errorf("%w: %w: legacy %s ledger is tombstoned as migrated but target directory %s is missing", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
 	}
 	if !initialize {
@@ -660,26 +1144,153 @@ func OpenProviderLedger(stateRoot string, provider string, initialize bool) (*Bu
 	if err := os.MkdirAll(absRoot, 0700); err != nil {
 		return nil, fmt.Errorf("%w: cannot create state root %s: %v", ErrLedgerSecurity, absRoot, err)
 	}
-	if err := os.Mkdir(targetRoot, 0700); err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("%w: cannot create target root %s: %v", ErrLedgerSecurity, targetRoot, err)
+
+	stageTargetName := fmt.Sprintf(".init-%s-%d-%s", spec.Provider, os.Getpid(), randomHex(8))
+	stageTargetDir := filepath.Join(absRoot, stageTargetName)
+	if err := os.MkdirAll(stageTargetDir, 0700); err != nil {
+		return nil, fmt.Errorf("%w: cannot create target stage dir %s: %v", ErrLedgerSecurity, stageTargetDir, err)
 	}
-	if err := checkDirPath(targetRoot); err != nil {
-		return nil, err
-	}
-	l, err := InitializeV2(targetLedgerDir, spec.TargetID)
+	_ = os.Chmod(stageTargetDir, 0700)
+	keepStageTarget := false
+	defer func() {
+		if !keepStageTarget {
+			_ = os.RemoveAll(stageTargetDir)
+		}
+	}()
+
+	lInit, err := InitializeV2(filepath.Join(stageTargetDir, "ledger"), spec.TargetID)
 	if err != nil {
 		return nil, err
 	}
-	if err := installFreshV2LegacySentinel(absRoot, legacyRoot, spec); err != nil {
-		_ = l.Close()
+	_ = lInit.Close()
+	stagedState, err := readStateFile(filepath.Join(stageTargetDir, "ledger"), spec.TargetID)
+	if err != nil {
 		return nil, err
 	}
-	return l, nil
+	if err := fsyncDirPath(filepath.Join(stageTargetDir, "ledger")); err != nil {
+		return nil, err
+	}
+	if err := fsyncDirPath(stageTargetDir); err != nil {
+		return nil, err
+	}
+	if err := fsyncDirPath(absRoot); err != nil {
+		return nil, err
+	}
+
+	stageSentinelName := fmt.Sprintf(".sentinel-%s-%d-%s", spec.Provider, os.Getpid(), randomHex(8))
+	stageSentinelDir := filepath.Join(absRoot, stageSentinelName)
+	stageSentinelLedgerDir := filepath.Join(stageSentinelDir, "ledger")
+	if err := os.MkdirAll(stageSentinelLedgerDir, 0700); err != nil {
+		return nil, fmt.Errorf("%w: cannot create legacy sentinel stage dir: %v", ErrLedgerSecurity, err)
+	}
+	_ = os.Chmod(stageSentinelDir, 0700)
+	_ = os.Chmod(stageSentinelLedgerDir, 0700)
+	publishedSentinel := false
+	defer func() {
+		if !publishedSentinel {
+			_ = os.RemoveAll(stageSentinelDir)
+		}
+	}()
+
+	lockPath := filepath.Join(stageSentinelLedgerDir, LockFilename)
+	lockFD, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("%w: create legacy sentinel lock: %v", ErrLedgerSecurity, err)
+	}
+	lockedSentinel := false
+	defer func() {
+		if lockedSentinel {
+			_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+		}
+		if lockFD >= 0 {
+			_ = syscall.Close(lockFD)
+		}
+	}()
+	if err := syscall.Fsync(lockFD); err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(lockFD, syscall.LOCK_EX); err != nil {
+		return nil, fmt.Errorf("lock legacy sentinel: %w", err)
+	}
+	lockedSentinel = true
+
+	intent := &MigrationIntent{
+		SchemaVersion:       SchemaVersionV2,
+		Mode:                IntentModeFreshInit,
+		TargetCreatedAtUTC:  stagedState.CreatedAtUTC,
+		StageDirName:        stageTargetName,
+		FromExperimentID:    spec.LegacyID,
+		ToExperimentID:      spec.TargetID,
+		LegacyDir:           spec.LegacyDir,
+		TargetDir:           spec.TargetDir,
+		EvidenceCount:       0,
+		EvidenceNamesDigest: computeEvidenceNamesDigest(nil),
+	}
+	if err := publishMigrationIntent(stageSentinelLedgerDir, intent); err != nil {
+		return nil, err
+	}
+	if err := fsyncDirPath(stageSentinelLedgerDir); err != nil {
+		return nil, err
+	}
+	if err := fsyncDirPath(stageSentinelDir); err != nil {
+		return nil, err
+	}
+	if err := fsyncDirPath(absRoot); err != nil {
+		return nil, err
+	}
+	if faultAfter == faultBeforeIntentPublish {
+		return nil, errors.New("injected fault before migration intent publish")
+	}
+
+	if err := unix.Renameat2(unix.AT_FDCWD, stageSentinelDir, unix.AT_FDCWD, legacyRoot, unix.RENAME_NOREPLACE); err != nil {
+		if errors.Is(err, syscall.EEXIST) || errors.Is(err, unix.EEXIST) {
+			_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+			lockedSentinel = false
+			_ = syscall.Close(lockFD)
+			lockFD = -1
+			_ = os.RemoveAll(stageSentinelDir)
+			publishedSentinel = true
+			_ = os.RemoveAll(stageTargetDir)
+			keepStageTarget = true
+			return openProviderLedgerWithHook(stateRoot, provider, initialize, faultAfter)
+		}
+		return nil, fmt.Errorf("%w: publish legacy v2 sentinel failed: %v", ErrMigrationState, err)
+	}
+	publishedSentinel = true
+	keepStageTarget = true
+	if err := fsyncDirPath(absRoot); err != nil {
+		return nil, err
+	}
+	if faultAfter == faultAfterIntentWrite {
+		return nil, errors.New("injected fault after migration intent write")
+	}
+
+	if _, err := resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot, spec, intent, nil, nil, false, faultAfter); err != nil {
+		return nil, err
+	}
+
+	_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+	lockedSentinel = false
+	_ = syscall.Close(lockFD)
+	lockFD = -1
+
+	tomb, backupState, err = verifyRetiredLegacyScaffold(legacyRoot, spec)
+	if err != nil {
+		return nil, err
+	}
+	targetState, err := readStateFile(targetLedgerDir, spec.TargetID)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyTargetProvenance(targetState, tomb, backupState, spec); err != nil {
+		return nil, err
+	}
+	return Open(targetLedgerDir)
 }
 
 func acquireLegacyMigrationLocks(legacyLedgerDir string, dryRun bool) (release func(), err error) {
 	lockPath := filepath.Join(legacyLedgerDir, LockFilename)
-	lockFD, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	lockFD, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return nil, fmt.Errorf("%w: legacy lock file missing", ErrLedgerSecurity)
@@ -696,7 +1307,7 @@ func acquireLegacyMigrationLocks(legacyLedgerDir string, dryRun bool) (release f
 	}
 
 	leasePath := filepath.Join(legacyLedgerDir, LeaseFilename)
-	leaseFlags := syscall.O_RDWR | syscall.O_NOFOLLOW | unix.O_CLOEXEC
+	leaseFlags := syscall.O_RDWR | syscall.O_NOFOLLOW | syscall.O_NONBLOCK | unix.O_CLOEXEC
 	if !dryRun {
 		leaseFlags |= syscall.O_CREAT
 	}
@@ -788,8 +1399,14 @@ func verifyWitnessPairs(ledgerDir string, state *LedgerState) error {
 		confRec, confErr := readWitnessRecord(ledgerDir, confName, "SETTLEMENT_CONFIRMATION", witnessExpID)
 		jSettled, isSettled := settledEntries[resID]
 		if isSettled {
-			if confRec == nil || confErr != nil || intentRec == nil || intentErr != nil {
-				return fmt.Errorf("%w: target settled reservation %s has missing or invalid witness", ErrSettlementEvidence, resID)
+			if intentErr != nil {
+				return fmt.Errorf("%w: %w: settled reservation %s has invalid intent witness: %w", ErrLedgerCorrupt, ErrSettlementEvidence, resID, intentErr)
+			}
+			if confErr != nil {
+				return fmt.Errorf("%w: %w: settled reservation %s has invalid confirmation witness: %w", ErrLedgerCorrupt, ErrSettlementEvidence, resID, confErr)
+			}
+			if confRec == nil || intentRec == nil {
+				return fmt.Errorf("%w: %w: settled reservation %s has missing witness", ErrLedgerCorrupt, ErrSettlementEvidence, resID)
 			}
 			if intentRec.ReservationID != jSettled.ReservationID || confRec.ReservationID != jSettled.ReservationID ||
 				intentRec.RequestID != jSettled.RequestID || confRec.RequestID != jSettled.RequestID ||
@@ -803,10 +1420,18 @@ func verifyWitnessPairs(ledgerDir string, state *LedgerState) error {
 				intentRec.SettledAmountMicros != jSettled.SettledAmountMicros || confRec.SettledAmountMicros != jSettled.SettledAmountMicros ||
 				intentRec.UnencumberedAmountMicros != jSettled.UnencumberedAmountMicros || confRec.UnencumberedAmountMicros != jSettled.UnencumberedAmountMicros ||
 				intentRec.TimestampUTC != jSettled.TimestampUTC || confRec.TimestampUTC != jSettled.TimestampUTC {
-				return fmt.Errorf("%w: target witness mismatch for reservation %s", ErrSettlementEvidence, resID)
+				return fmt.Errorf("%w: %w: witness mismatch for reservation %s", ErrLedgerCorrupt, ErrSettlementEvidence, resID)
 			}
-		} else if intentRec != nil || intentErr != nil || confRec != nil || confErr != nil {
-			return fmt.Errorf("%w: target dangling witness for reservation %s", ErrSettlementEvidence, resID)
+		} else {
+			if intentErr != nil {
+				return fmt.Errorf("%w: %w: dangling invalid intent witness for reservation %s: %w", ErrLedgerCorrupt, ErrSettlementEvidence, resID, intentErr)
+			}
+			if confErr != nil {
+				return fmt.Errorf("%w: %w: dangling invalid confirmation witness for reservation %s: %w", ErrLedgerCorrupt, ErrSettlementEvidence, resID, confErr)
+			}
+			if intentRec != nil || confRec != nil {
+				return fmt.Errorf("%w: %w: dangling witness for reservation %s", ErrLedgerCorrupt, ErrSettlementEvidence, resID)
+			}
 		}
 	}
 	return nil
@@ -835,7 +1460,7 @@ func inspectTargetLedgerReadOnly(targetLedgerDir string, expectedExpID string) (
 	}
 
 	lockPath := filepath.Join(targetLedgerDir, LockFilename)
-	lockFD, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	lockFD, err := syscall.Open(lockPath, syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return nil, fmt.Errorf("%w: runtime lock file missing", ErrLedgerSecurity)
@@ -854,7 +1479,7 @@ func inspectTargetLedgerReadOnly(targetLedgerDir string, expectedExpID string) (
 	}()
 
 	leasePath := filepath.Join(targetLedgerDir, LeaseFilename)
-	leaseFD, err := syscall.Open(leasePath, syscall.O_RDWR|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	leaseFD, err := syscall.Open(leasePath, syscall.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|unix.O_CLOEXEC, 0)
 	if err == nil {
 		if cerr := checkDescriptor(leaseFD, false); cerr != nil {
 			_ = syscall.Close(leaseFD)
@@ -909,62 +1534,35 @@ func inspectTargetLedgerReadOnly(targetLedgerDir string, expectedExpID string) (
 	return state, nil
 }
 
-func verifyLegacyWitnessesBeforeMigration(legacyLedgerDir string, legacyState *LedgerState, expID string) ([]string, error) {
+func verifyLegacyWitnessesBeforeMigration(legacyLedgerDir string, legacyState *LedgerState, _ string) ([]string, error) {
 	entries, err := os.ReadDir(legacyLedgerDir)
 	if err != nil {
 		return nil, err
 	}
-	settledRes := make(map[string]bool)
-	for _, e := range legacyState.Journal {
-		if e.EntryType == "SETTLED" {
-			settledRes[e.ReservationID] = true
-		}
-	}
 
 	var witnessFiles []string
-	intentSeen := make(map[string]bool)
-	confSeen := make(map[string]bool)
 	for _, de := range entries {
 		name := de.Name()
-		switch {
-		case strings.HasPrefix(name, IntentFilePrefix) && strings.HasSuffix(name, ".json"):
-			resID := name[len(IntentFilePrefix) : len(name)-len(".json")]
-			if _, err := readWitnessRecord(legacyLedgerDir, name, "SETTLEMENT_INTENT", expID); err != nil {
-				return nil, fmt.Errorf("%w: legacy intent witness %s invalid: %v", ErrLedgerCorrupt, name, err)
-			}
-			intentSeen[resID] = true
-			witnessFiles = append(witnessFiles, name)
-		case strings.HasPrefix(name, ConfirmationFilePrefix) && strings.HasSuffix(name, ".json"):
-			resID := name[len(ConfirmationFilePrefix) : len(name)-len(".json")]
-			if _, err := readWitnessRecord(legacyLedgerDir, name, "SETTLEMENT_CONFIRMATION", expID); err != nil {
-				return nil, fmt.Errorf("%w: legacy confirmation witness %s invalid: %v", ErrLedgerCorrupt, name, err)
-			}
-			confSeen[resID] = true
-			witnessFiles = append(witnessFiles, name)
+		isIntent := strings.HasPrefix(name, IntentFilePrefix) && strings.HasSuffix(name, ".json")
+		isConf := strings.HasPrefix(name, ConfirmationFilePrefix) && strings.HasSuffix(name, ".json")
+		if !isIntent && !isConf {
+			continue
 		}
+		if err := verifyRegularWitnessFile(filepath.Join(legacyLedgerDir, name)); err != nil {
+			return nil, fmt.Errorf("%w: legacy witness %s invalid: %w", ErrLedgerCorrupt, name, err)
+		}
+		witnessFiles = append(witnessFiles, name)
 	}
 	if !legacyState.Halted {
-		for resID := range settledRes {
-			if !intentSeen[resID] || !confSeen[resID] {
-				return nil, fmt.Errorf("%w: legacy settled reservation %s missing intent/confirmation witness", ErrLedgerCorrupt, resID)
-			}
-		}
-		for resID := range intentSeen {
-			if !settledRes[resID] {
-				return nil, fmt.Errorf("%w: legacy dangling intent witness %s", ErrLedgerCorrupt, resID)
-			}
-		}
-		for resID := range confSeen {
-			if !settledRes[resID] {
-				return nil, fmt.Errorf("%w: legacy dangling confirmation witness %s", ErrLedgerCorrupt, resID)
-			}
+		if err := verifyWitnessPairs(legacyLedgerDir, legacyState); err != nil {
+			return nil, err
 		}
 	}
 	sort.Strings(witnessFiles)
 	return witnessFiles, nil
 }
 
-func verifyTargetMatchesLegacyPrefix(legacyState *LedgerState, targetState *LedgerState, spec ProviderLedgerSpec) error {
+func verifyTargetMatchesLegacyPrefix(legacyState *LedgerState, targetState *LedgerState, spec ProviderLedgerSpec, expectedInspectionGen int) error {
 	if targetState.SchemaVersion != SchemaVersionV2 {
 		return fmt.Errorf("%w: target schema_version=%d != %d", ErrLedgerCorrupt, targetState.SchemaVersion, SchemaVersionV2)
 	}
@@ -990,7 +1588,7 @@ func verifyTargetMatchesLegacyPrefix(legacyState *LedgerState, targetState *Ledg
 		return fmt.Errorf("%w: target journal length (%d) != legacy (%d)+1", ErrLedgerCorrupt, len(targetState.Journal), len(legacyState.Journal))
 	}
 	last := targetState.Journal[len(targetState.Journal)-1]
-	if last.EntryType != "MIGRATED" || last.ExperimentID != spec.TargetID || last.FromExperimentID != spec.LegacyID || last.LegacyDirName != spec.LegacyDir || last.Reason != MigrationReasonCLI {
+	if last.EntryType != "MIGRATED" || last.ExperimentID != spec.TargetID || last.FromExperimentID != spec.LegacyID || last.LegacyDirName != spec.LegacyDir || last.Reason != MigrationReasonCLI || last.InspectionGeneration != expectedInspectionGen {
 		return fmt.Errorf("%w: target journal final entry is not matching MIGRATED record", ErrLedgerCorrupt)
 	}
 	for i := range legacyState.Journal {
@@ -1029,7 +1627,7 @@ func makeMigrationResult(provider, status, legacyRoot, targetRoot string, st *Le
 	return res
 }
 
-func retireEmptyOrEvidenceOnlyLegacy(absRoot, legacyRoot, targetRoot, targetLedgerDir string, spec ProviderLedgerSpec, evidenceFiles []string, dryRun bool) (*MigrationResult, error) {
+func retireEmptyOrEvidenceOnlyLegacy(absRoot, legacyRoot, targetRoot string, spec ProviderLedgerSpec, evidenceFiles []string, dryRun bool, faultAfter migrateFaultStep) (*MigrationResult, error) {
 	if dryRun {
 		return makeMigrationResult(spec.Provider, "would_retire_empty_legacy", legacyRoot, targetRoot, nil), nil
 	}
@@ -1039,9 +1637,9 @@ func retireEmptyOrEvidenceOnlyLegacy(absRoot, legacyRoot, targetRoot, targetLedg
 		return nil, fmt.Errorf("%w: cannot create retire stage dir: %v", ErrLedgerSecurity, err)
 	}
 	_ = os.Chmod(stageDir, 0700)
-	committedTarget := false
+	keepStageDir := false
 	defer func() {
-		if !committedTarget {
+		if !keepStageDir {
 			_ = os.RemoveAll(stageDir)
 		}
 	}()
@@ -1051,52 +1649,112 @@ func retireEmptyOrEvidenceOnlyLegacy(absRoot, legacyRoot, targetRoot, targetLedg
 		return nil, err
 	}
 	_ = l.Close()
+	stagedState, err := readStateFile(filepath.Join(stageDir, "ledger"), spec.TargetID)
+	if err != nil {
+		return nil, err
+	}
 
 	for _, name := range evidenceFiles {
 		if err := copyVerifiedEvidenceFile(legacyRoot, stageDir, name); err != nil {
 			return nil, err
 		}
 	}
+	if err := fsyncDirPath(filepath.Join(stageDir, "ledger")); err != nil {
+		return nil, err
+	}
 	if err := fsyncDirPath(stageDir); err != nil {
 		return nil, err
 	}
-	if err := unix.Renameat2(unix.AT_FDCWD, stageDir, unix.AT_FDCWD, targetRoot, unix.RENAME_NOREPLACE); err != nil {
-		return nil, fmt.Errorf("atomic target directory publish failed: %w", err)
-	}
-	committedTarget = true
-	if err := fsyncDirPath(absRoot); err != nil {
-		return nil, err
-	}
 
-	legacyLedgerDir := filepath.Join(legacyRoot, "ledger")
-	if err := os.Mkdir(legacyLedgerDir, 0700); err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("%w: cannot create legacy retirement ledger dir: %v", ErrLedgerSecurity, err)
+	stageLedgerName := fmt.Sprintf(".retire-ledger-%s-%d-%s", spec.Provider, os.Getpid(), randomHex(8))
+	stageLedgerDir := filepath.Join(absRoot, stageLedgerName)
+	if err := os.MkdirAll(stageLedgerDir, 0700); err != nil {
+		return nil, fmt.Errorf("%w: cannot create legacy retirement ledger stage dir: %v", ErrLedgerSecurity, err)
 	}
-	if err := os.Chmod(legacyLedgerDir, 0700); err != nil {
-		return nil, err
-	}
-	if err := checkDirPath(legacyLedgerDir); err != nil {
-		return nil, err
-	}
-	lockPath := filepath.Join(legacyLedgerDir, LockFilename)
-	lockFD, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW, 0600)
+	_ = os.Chmod(stageLedgerDir, 0700)
+	publishedLedgerStage := false
+	defer func() {
+		if !publishedLedgerStage {
+			_ = os.RemoveAll(stageLedgerDir)
+		}
+	}()
+
+	lockPath := filepath.Join(stageLedgerDir, LockFilename)
+	lockFD, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cannot create legacy retirement lock: %v", ErrLedgerSecurity, err)
 	}
-	_ = syscall.Fsync(lockFD)
-	_ = syscall.Close(lockFD)
+	defer func() {
+		_ = syscall.Flock(lockFD, syscall.LOCK_UN)
+		_ = syscall.Close(lockFD)
+	}()
+	if err := syscall.Fsync(lockFD); err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(lockFD, syscall.LOCK_EX); err != nil {
+		return nil, fmt.Errorf("lock legacy retirement dir: %w", err)
+	}
 
-	if err := publishTombstone(legacyRoot, spec, TombstoneModeFreshV2, nowUTCStr()); err != nil {
+	intent := &MigrationIntent{
+		SchemaVersion:       SchemaVersionV2,
+		Mode:                IntentModeRetireEmpty,
+		TargetCreatedAtUTC:  stagedState.CreatedAtUTC,
+		StageDirName:        stageName,
+		FromExperimentID:    spec.LegacyID,
+		ToExperimentID:      spec.TargetID,
+		LegacyDir:           spec.LegacyDir,
+		TargetDir:           spec.TargetDir,
+		EvidenceCount:       len(evidenceFiles),
+		EvidenceNamesDigest: computeEvidenceNamesDigest(evidenceFiles),
+	}
+	if err := publishMigrationIntent(stageLedgerDir, intent); err != nil {
 		return nil, err
 	}
-	if err := fsyncDirPath(legacyLedgerDir); err != nil {
+	if err := fsyncDirPath(stageLedgerDir); err != nil {
 		return nil, err
 	}
+	if err := fsyncDirPath(absRoot); err != nil {
+		return nil, err
+	}
+	if faultAfter == faultBeforeIntentPublish {
+		return nil, errors.New("injected fault before migration intent publish")
+	}
+
+	legacyLedgerDir := filepath.Join(legacyRoot, "ledger")
+	if _, lerr := os.Lstat(legacyLedgerDir); lerr == nil {
+		if err := checkDirPath(legacyLedgerDir); err != nil {
+			return nil, err
+		}
+		legEntries, err := os.ReadDir(legacyLedgerDir)
+		if err != nil {
+			return nil, fmt.Errorf("%w: cannot read legacy ledger dir: %v", ErrLedgerSecurity, err)
+		}
+		if len(legEntries) != 0 {
+			return nil, fmt.Errorf("%w: %w: legacy ledger dir %s is not empty", ErrLedgerCorrupt, ErrMigrationState, legacyLedgerDir)
+		}
+		if err := syscall.Rename(stageLedgerDir, legacyLedgerDir); err != nil {
+			return nil, fmt.Errorf("%w: atomic install of legacy retirement ledger dir failed: %v", ErrMigrationState, err)
+		}
+	} else if os.IsNotExist(lerr) {
+		if err := unix.Renameat2(unix.AT_FDCWD, stageLedgerDir, unix.AT_FDCWD, legacyLedgerDir, unix.RENAME_NOREPLACE); err != nil {
+			return nil, fmt.Errorf("%w: atomic publish of legacy retirement ledger dir failed: %v", ErrMigrationState, err)
+		}
+	} else {
+		return nil, fmt.Errorf("%w: cannot stat legacy ledger dir %s: %v", ErrLedgerSecurity, legacyLedgerDir, lerr)
+	}
+	publishedLedgerStage = true
+	keepStageDir = true
 	if err := fsyncDirPath(legacyRoot); err != nil {
 		return nil, err
 	}
+	if err := fsyncDirPath(absRoot); err != nil {
+		return nil, err
+	}
+	if faultAfter == faultAfterIntentWrite {
+		return nil, errors.New("injected fault after migration intent write")
+	}
 
-	st, err := readStateFile(targetLedgerDir, spec.TargetID)
+	st, err := resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot, spec, intent, evidenceFiles, nil, false, faultAfter)
 	if err != nil {
 		return nil, err
 	}
@@ -1165,19 +1823,64 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 		if !legacyExists {
 			return nil, fmt.Errorf("%w: %w: target %s directory %s lacks matching legacy retirement scaffold", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
 		}
+
+		var unlockScaffold func()
+		if _, lockStatErr := os.Lstat(filepath.Join(legacyLedgerDir, LockFilename)); lockStatErr == nil {
+			unlockScaffold, err = lockLegacyScaffold(legacyLedgerDir)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w: legacy %s lock invalid: %w", ErrLedgerCorrupt, ErrMigrationState, provider, err)
+			}
+			defer unlockScaffold()
+		} else if !os.IsNotExist(lockStatErr) {
+			return nil, fmt.Errorf("%w: %w: cannot stat legacy lock: %v", ErrLedgerSecurity, ErrMigrationState, lockStatErr)
+		}
+
+		intentPath := filepath.Join(legacyLedgerDir, MigrationIntentFilename)
+		if _, iErr := os.Lstat(intentPath); iErr == nil {
+			if unlockScaffold == nil {
+				return nil, fmt.Errorf("%w: %w: legacy %s migration intent present without lock file", ErrLedgerCorrupt, ErrMigrationState, provider)
+			}
+			intent, err := validateMigrationIntent(legacyLedgerDir, spec)
+			if err != nil {
+				return nil, err
+			}
+			existingTomb, evFiles, err := verifyLegacyScaffoldDuringIntent(legacyRoot, legacyLedgerDir, intent, spec)
+			if err != nil {
+				return nil, err
+			}
+			st, err := resumeOrFinalizeIntentUnderLock(absRoot, legacyRoot, legacyLedgerDir, targetRoot, spec, intent, evFiles, existingTomb, dryRun, faultAfter)
+			if err != nil {
+				return nil, err
+			}
+			if intent.Mode == IntentModeRetireEmpty {
+				if dryRun {
+					return makeMigrationResult(provider, "would_retire_empty_legacy", legacyRoot, targetRoot, st), nil
+				}
+				return makeMigrationResult(provider, "retired_empty_legacy", legacyRoot, targetRoot, st), nil
+			}
+			if dryRun {
+				return makeMigrationResult(provider, "would_finalize_interrupted_migration", legacyRoot, targetRoot, st), nil
+			}
+			return makeMigrationResult(provider, "initialized_v2", legacyRoot, targetRoot, st), nil
+		} else if !os.IsNotExist(iErr) {
+			return nil, fmt.Errorf("%w: %w: cannot stat migration intent: %v", ErrLedgerSecurity, ErrMigrationState, iErr)
+		}
+
 		tomb, backupState, err := verifyRetiredLegacyScaffold(legacyRoot, spec)
 		if err != nil {
-			if errors.Is(err, ErrLedgerNotFound) && !targetExists {
+			if errors.Is(err, ErrLedgerNotFound) {
 				emptyOK, cErr := classifyLegacyWithoutState(legacyRoot)
 				if cErr == nil && emptyOK {
 					evFiles, evErr := verifyEvidenceFilesReadOnly(legacyRoot)
 					if evErr != nil {
 						return nil, evErr
 					}
-					return retireEmptyOrEvidenceOnlyLegacy(absRoot, legacyRoot, targetRoot, targetLedgerDir, spec, evFiles, dryRun)
+					if !targetExists {
+						return retireEmptyOrEvidenceOnlyLegacy(absRoot, legacyRoot, targetRoot, spec, evFiles, dryRun, faultAfter)
+					}
 				}
 			}
-			return nil, fmt.Errorf("%w: %w: legacy state missing and retirement scaffold invalid: %v", ErrLedgerCorrupt, ErrMigrationState, err)
+			return nil, fmt.Errorf("%w: %w: legacy state missing and retirement scaffold invalid: %w", ErrLedgerCorrupt, ErrMigrationState, err)
 		}
 		if !targetExists {
 			return nil, fmt.Errorf("%w: %w: legacy %s directory is tombstoned but target directory %s is missing", ErrLedgerCorrupt, ErrMigrationState, provider, targetRoot)
@@ -1257,18 +1960,41 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 		if err != nil {
 			return nil, err
 		}
-		if err := verifyTargetMatchesLegacyPrefix(legacyState, targetState, spec); err != nil {
+		if err := verifyTargetMatchesLegacyPrefix(legacyState, targetState, spec, nextGen); err != nil {
 			return nil, err
+		}
+		for _, ev := range evidenceFiles {
+			dstEv := filepath.Join(targetRoot, ev)
+			if err := verifyOneEvidenceFile(dstEv); err != nil {
+				return nil, err
+			}
+			if err := verifiedFilesEqual(filepath.Join(legacyRoot, ev), dstEv, MaxEvidenceFileBytes); err != nil {
+				return nil, err
+			}
+		}
+		if legacyState.Halted {
+			for _, wf := range witnessFiles {
+				dstWf := filepath.Join(targetLedgerDir, wf)
+				if err := verifyRegularWitnessFile(dstWf); err != nil {
+					return nil, fmt.Errorf("%w: %w: target witness %s invalid: %w", ErrLedgerCorrupt, ErrMigrationState, wf, err)
+				}
+				if err := verifiedFilesEqual(filepath.Join(legacyLedgerDir, wf), dstWf, MaxStateFileBytes); err != nil {
+					return nil, err
+				}
+			}
 		}
 		if dryRun {
 			return makeMigrationResult(provider, "would_finalize_interrupted_migration", legacyRoot, targetRoot, targetState), nil
 		}
 
+		if err := cleanupStaleTombstoneTemps(legacyRoot); err != nil {
+			return nil, err
+		}
 		if tomb, tombErr := validateTombstone(legacyRoot, spec); tombErr != nil || tomb.Mode != TombstoneModeMigrated {
 			if tombErr == nil && tomb.Mode != TombstoneModeMigrated {
 				return nil, fmt.Errorf("%w: %w: unexpected tombstone mode %q during recovery", ErrLedgerCorrupt, ErrMigrationState, tomb.Mode)
 			}
-			if err := publishTombstone(legacyRoot, spec, TombstoneModeMigrated, nowUTCStr()); err != nil {
+			if err := publishTombstone(legacyRoot, spec, TombstoneModeMigrated, nowUTCStr(), ""); err != nil {
 				return nil, err
 			}
 			if faultAfter == faultAfterTombstoneWrite {
@@ -1322,7 +2048,7 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 	}
 
 	stageLockPath := filepath.Join(stageLedgerDir, LockFilename)
-	slFD, err := syscall.Open(stageLockPath, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW, 0600)
+	slFD, err := syscall.Open(stageLockPath, syscall.O_CREAT|syscall.O_EXCL|syscall.O_RDWR|syscall.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("create stage lock: %w", err)
 	}
@@ -1406,7 +2132,7 @@ func migrateProviderLedgerWithHook(stateRoot string, provider string, dryRun boo
 	}
 
 	// Step B.1: write tombstone inside legacyRoot BEFORE moving legacy ledger.json aside.
-	if err := publishTombstone(legacyRoot, spec, TombstoneModeMigrated, now); err != nil {
+	if err := publishTombstone(legacyRoot, spec, TombstoneModeMigrated, now, ""); err != nil {
 		return nil, err
 	}
 	if faultAfter == faultAfterTombstoneWrite {

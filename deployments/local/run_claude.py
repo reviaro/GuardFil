@@ -44,7 +44,7 @@ from deployments.local.executor import AgentSpec, Executor, Mount, RelaySpec  # 
 from deployments.local.runtime_cleanup import cleanup_after_error, finish_cli_cleanup, stop_session  # noqa: E402
 from deployments.local.run_codex import parse_mcp  # noqa: E402
 
-IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+IMAGE = "golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 RELAY_PORT = 8899
 WORKSPACE = "/workspace"
 MODEL = "claude-sonnet-5-5"

@@ -576,7 +576,7 @@ func TestEnvelopeMarshalJSON(t *testing.T) {
 		t.Fatalf("expected ErrInvalidEnvelope for envelope exceeding 2048 bytes, got %v", err)
 	}
 
-	// QA M1: MarshalJSON at exactly 2048 bytes is accepted and at exactly 2049 is refused.
+	// MarshalJSON at exactly 2048 bytes is accepted and at exactly 2049 is refused.
 	env2048 := Envelope{
 		SchemaVersion: SchemaVersion,
 		Code:          POLICY_UNAVAILABLE,

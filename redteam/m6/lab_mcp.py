@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stdio MCP server exposing the M5 fixture tools behind GuardFil's filter proxy.
+"""Stdio MCP server exposing the fixture tools behind GuardFil's filter proxy.
 
 Tools:
   lab.ping         ping the fixture app via GuardFil gateway

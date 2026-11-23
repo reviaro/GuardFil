@@ -305,12 +305,22 @@ func SSE(msg map[string]any) []byte {
 				continue
 			}
 			t, _ := b["type"].(string)
-			var first, delta any
-			if t == "text" {
+			var first any
+			var deltas []map[string]any
+			switch t {
+			case "text":
 				txt, _ := b["text"].(string)
 				first = map[string]any{"type": "text", "text": ""}
-				delta = map[string]any{"type": "text_delta", "text": txt}
-			} else if t == "tool_use" {
+				deltas = append(deltas, map[string]any{"type": "text_delta", "text": txt})
+			case "thinking":
+				first = map[string]any{"type": "thinking", "thinking": "", "signature": ""}
+				if thinking, ok := b["thinking"].(string); ok {
+					deltas = append(deltas, map[string]any{"type": "thinking_delta", "thinking": thinking})
+				}
+				if signature, ok := b["signature"].(string); ok {
+					deltas = append(deltas, map[string]any{"type": "signature_delta", "signature": signature})
+				}
+			case "tool_use":
 				first = map[string]any{
 					"type":  "tool_use",
 					"id":    b["id"],
@@ -318,20 +328,19 @@ func SSE(msg map[string]any) []byte {
 					"input": map[string]any{},
 				}
 				argsEnc, _ := json.Marshal(b["input"])
-				delta = map[string]any{
+				deltas = append(deltas, map[string]any{
 					"type":         "input_json_delta",
 					"partial_json": string(argsEnc),
-				}
-			} else {
+				})
+			default:
 				first = b
-				delta = nil
 			}
 			parts = append(parts, ev("content_block_start", map[string]any{
 				"type":          "content_block_start",
 				"index":         i,
 				"content_block": first,
 			}))
-			if delta != nil {
+			for _, delta := range deltas {
 				parts = append(parts, ev("content_block_delta", map[string]any{
 					"type":  "content_block_delta",
 					"index": i,

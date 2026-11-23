@@ -51,10 +51,10 @@ if args == ['version']:
         print('go: forced toolchain failure empty', file=sys.stderr)
         sys.exit(73)
     if os.environ.get('INJECT_GO_VERSION_ERROR_MISLEADING') == '1':
-        print('go version go1.27.1 linux/amd64')
+        print('go version go1.27.4 linux/amd64')
         print('go: forced toolchain failure after output', file=sys.stderr)
         sys.exit(73)
-    print('go version go1.27.1 linux/amd64')
+    print('go version go1.27.4 linux/amd64')
 elif args[:2] == ['version', '-m']:
     print('build\tvcs.revision=' + os.environ.get('TEST_COMMIT', ''))
     print('build\tvcs.time=' + os.environ.get('TEST_TIME', ''))
@@ -489,14 +489,14 @@ EOF
 ) && record_result "defect-repro: old test -z gofmt masks formatter failure (exit 0 reproduced)" "PASS" "" \
   || record_result "defect-repro: old test -z gofmt masks formatter failure (exit 0 reproduced)" "FAIL" "pre-fix defect did not reproduce"
 
-# Case 21: Old broken go version pipeline mask (test "$(go version | awk ...)" = go1.27.1)
+# Case 21: Old broken go version pipeline mask (test "$(go version | awk ...)" = go1.27.4)
 (
     set +e
     mutant_out=$(
         sh -c '
             export PATH="'"$SHIM_BIN"':$PATH"
             export INJECT_GO_VERSION_ERROR_MISLEADING=1
-            test "$(go version | awk "{print \$3}")" = go1.27.1
+            test "$(go version | awk "{print \$3}")" = go1.27.4
         ' 2>&1
     )
     mutant_rc=$?
@@ -725,7 +725,7 @@ GOVER
             chmod +x "'"$SHIM_BIN"'/go"
             raw_go_version=$(go version)
             test -n "$raw_go_version"
-            test "$(printf "%s\n" "$raw_go_version" | awk "{print \$3}")" = "go1.27.1"
+            test "$(printf "%s\n" "$raw_go_version" | awk "{print \$3}")" = "go1.27.4"
         ' 2>&1
     )
     rc=$?

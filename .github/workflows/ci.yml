@@ -5,7 +5,7 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     container:
-      image: golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195
+      image: golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
     env:
       GOTOOLCHAIN: local
       GOFLAGS: -mod=readonly
@@ -31,7 +31,7 @@ jobs:
         run: go list -m -json all > /dev/null
       - run: go mod verify
       - run: go vet ./...
-      - name: Focused P11 ProcessShell build test
+      - name: Focused ProcessShell build test
         run: go test ./tests/security -run '^TestP11ProcessShellBuilds$' -count=1
       - run: go test ./...
       - run: go test -race ./...
@@ -73,7 +73,7 @@ jobs:
           python3 -m unittest deployments.local.test_local_config
           python3 -m unittest redteam.m5.test_redteam redteam.m5.test_run_redteam redteam.m6.test_standin redteam.m6.test_scripted_scorer redteam.m6.test_lab_mcp
       - name: Pull the pinned executor image
-        run: docker pull golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195
+        run: docker pull golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
       - name: Raw-mount admission against real bind mounts
         run: python3 -B deployments/local/test_mount_alias_binds.py --docker
       - name: Enable filesystem mediation on the disposable runner
@@ -85,7 +85,7 @@ jobs:
       - name: Build runtime binaries and filesystem integration tests
         run: |
           docker run --rm -v "$PWD:/w" -w /w -e CGO_ENABLED=0 -e GOTOOLCHAIN=local -e GOFLAGS=-buildvcs=false \
-            golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 \
+            golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea \
             sh -c 'go build -trimpath -o /w/.ci-bin/guardfil-broker ./cmd/guardfil-broker && go build -trimpath -o /w/.ci-bin/guardfil-mcp-proxy ./cmd/guardfil-mcp-proxy && go build -trimpath -o /w/.ci-bin/guardfil-workspace ./cmd/guardfil-workspace && go test -c -o /w/.ci-bin/workspacefs.test ./internal/workspacefs && chown -R '"$(id -u):$(id -g)"' /w/.ci-bin'
           echo "GUARDFIL_BROKER_BIN=$PWD/.ci-bin/guardfil-broker" >> "$GITHUB_ENV"
           echo "GUARDFIL_MCP_PROXY_BIN=$PWD/.ci-bin/guardfil-mcp-proxy" >> "$GITHUB_ENV"

@@ -1,10 +1,10 @@
-# The release workflow must provide a digest-pinned, trusted Go 1.27.1 builder image.
-ARG GO_BUILDER_IMAGE=golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195
+# The release workflow must provide a digest-pinned, trusted Go 1.27.4 builder image.
+ARG GO_BUILDER_IMAGE=golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea
 FROM ${GO_BUILDER_IMAGE} AS build
 ARG GO_BUILDER_IMAGE
 WORKDIR /src
 COPY go.mod ./
-RUN test -n "$GO_BUILDER_IMAGE" && case "$GO_BUILDER_IMAGE" in *@sha256:*) ;; *) exit 64;; esac && test "$(go version | awk '{print $3}')" = go1.27.1
+RUN test -n "$GO_BUILDER_IMAGE" && case "$GO_BUILDER_IMAGE" in *@sha256:*) ;; *) exit 64;; esac && test "$(go version | awk '{print $3}')" = go1.27.4
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=true -ldflags='-s -w' -o /out/guardfil ./cmd/guardfil
 # The MCP filter proxy runs inside agent containers; guardfil-local.sh copies it out.

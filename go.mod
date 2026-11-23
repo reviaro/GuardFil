@@ -2,7 +2,7 @@ module github.com/reviaro/guardfil
 
 go 1.27
 
-toolchain go1.27.1
+toolchain go1.27.4
 
 require (
 	github.com/hanwen/go-fuse/v2 v2.12.1

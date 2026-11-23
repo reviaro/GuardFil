@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -115,6 +116,45 @@ func setupTestBroker(t *testing.T, statuses []int, replies [][]byte, priorMicros
 		_ = os.RemoveAll(tempDir)
 	}
 	return srv, ledger, ft, cleanup
+}
+
+func TestSSEPreservesThinkingAcrossToolTurns(t *testing.T) {
+	for _, thinking := range []string{"synthetic fixture", ""} {
+		block := map[string]any{"type": "thinking", "thinking": thinking, "signature": "fixture-signature"}
+		stream := SSE(map[string]any{"content": []any{block}})
+		var got []map[string]any
+		for _, line := range strings.Split(string(stream), "\n") {
+			data, ok := strings.CutPrefix(line, "data: ")
+			if !ok {
+				continue
+			}
+			var event struct {
+				Type  string         `json:"type"`
+				Start map[string]any `json:"content_block"`
+				Delta map[string]any `json:"delta"`
+			}
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				t.Fatal(err)
+			}
+			switch event.Type {
+			case "content_block_start":
+				got = append(got, event.Start)
+			case "content_block_delta":
+				got = append(got, event.Delta)
+			case "content_block_stop":
+				got = append(got, map[string]any{"type": "stop"})
+			}
+		}
+		want := []map[string]any{
+			{"type": "thinking", "thinking": "", "signature": ""},
+			{"type": "thinking_delta", "thinking": thinking},
+			{"type": "signature_delta", "signature": block["signature"]},
+			{"type": "stop"},
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("block events = %v, want %v", got, want)
+		}
+	}
 }
 
 func TestSettlesWithCacheCountedAndStreamsBack(t *testing.T) {

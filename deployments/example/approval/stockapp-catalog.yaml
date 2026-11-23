@@ -1,4 +1,4 @@
-# Tool catalog for a stock app's agent tools (the owner's example; M3).
+# Tool catalog for a stock app's agent tools.
 # Install: deployments/local/guardfil-local.sh catalog deployments/example/approval/stockapp-catalog.yaml
 catalog_version: 1
 tools:
@@ -27,7 +27,7 @@ tools:
     arguments:
       amount:      {type: decimal, required: true, min: "0.01"}
       destination: {type: string, required: true, max_length: 64}
-  # M4: a third-party news feed (results may carry prompt injection) and a
+  # A third-party news feed (results may carry prompt injection) and a
   # free-text message to the support desk (requests may carry listed words).
   - id: stockapp.get_news
     description: Headlines for a stock

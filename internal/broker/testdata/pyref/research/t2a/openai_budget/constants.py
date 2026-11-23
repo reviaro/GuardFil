@@ -36,7 +36,7 @@ MIN_RESERVATION_MICROS: int = MAX_OUTPUT_TOKENS * OUTPUT_TOKEN_RATE_MICROS
 PINNED_MODEL: str = "gpt-6-luna"
 PINNED_SERVICE_TIER: str = "default"
 
-# Per-model accounting (M3 step 7, model-neutral broker): model id as the
+# Per-model accounting (model-neutral broker): model id as the
 # provider reports it -> (input micro-USD per token, output micro-USD per token,
 # service tier the receipt must carry).  The one $2 ceiling covers them all.
 # Only models listed here can be settled.

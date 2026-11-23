@@ -9,7 +9,7 @@ import (
 	"github.com/reviaro/guardfil/internal/action"
 )
 
-// TestActionParserBounds is an independent regression for commit 1249f74.
+// TestActionParserBounds checks input limits at the parser boundary.
 // It verifies limits at their exact boundary and asserts parser failure (rather
 // than later schema failure) for an over-limit nested object and decoded string.
 func TestActionParserBounds(t *testing.T) {

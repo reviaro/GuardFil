@@ -295,7 +295,7 @@ func readStateFile(dir string, expectedExpID string) (*LedgerState, error) {
 
 func readStateFileByName(dir string, filename string, expectedExpID string) (*LedgerState, error) {
 	statePath := filepath.Join(dir, filename)
-	fd, err := syscall.Open(statePath, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(statePath, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return nil, ErrLedgerNotFound
@@ -346,7 +346,7 @@ func readStateFileByName(dir string, filename string, expectedExpID string) (*Le
 
 func readWitnessRecord(dir string, name string, expectedType string, expID string) (*WitnessRecord, error) {
 	p := filepath.Join(dir, name)
-	fd, err := syscall.Open(p, syscall.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(p, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		if errors.Is(err, syscall.ENOENT) {
 			return nil, nil

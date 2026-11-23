@@ -24,6 +24,9 @@ const (
 	TombstoneFilename          = "migrated_to.json"
 	TombstoneModeMigrated      = "migrated"
 	TombstoneModeFreshV2       = "fresh_v2"
+	MigrationIntentFilename    = "migration_intent.json"
+	IntentModeFreshInit        = "fresh_init"
+	IntentModeRetireEmpty      = "retire_empty_legacy"
 	PreMigrationBackupFilename = "ledger.json.pre-migration-backup"
 	MigrationReasonCLI         = "CLI_MIGRATE"
 

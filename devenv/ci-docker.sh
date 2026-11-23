@@ -10,7 +10,7 @@ REF="${1:-HEAD}"
 REPO="${2:-$(cd "$(dirname "$0")/.." && pwd)}"
 SHA="$(git -C "$REPO" rev-parse --verify "$REF^{commit}")"
 GITDIR="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)"
-IMAGE='golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195'
+IMAGE='golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea'
 echo "ci-docker: testing $SHA"
 
 MSYS_NO_PATHCONV=1 docker run --rm \

@@ -14,9 +14,9 @@ these controls cover.
   GuardFil's broker, which holds the key and enforces a spending limit.
 - **Documentation:** Full user and operator guide in [docs/guide/](docs/guide/README.md).
 
-> **Alpha: [`v0.1.0-alpha.4`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.4).**
+> **Alpha: [`v0.1.0-alpha.5`](https://github.com/reviaro/GuardFil/releases/tag/v0.1.0-alpha.5).**
 > Linux with Docker, for one person on one machine. Install from source using
-> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.4.md)
+> the tagged quickstart below. See the [release notes](docs/releases/v0.1.0-alpha.5.md)
 > and [limits](#limits) before relying on it. Report vulnerabilities privately: [SECURITY.md](SECURITY.md).
 > Licensed under the [GNU AGPL v3](LICENSE).
 
@@ -43,7 +43,7 @@ agents do not start: there is no fallback to the raw folder. See
 **1. Get GuardFil and set it up** (once):
 
 ```sh
-git clone --branch v0.1.0-alpha.4 --single-branch https://github.com/reviaro/GuardFil.git
+git clone --branch v0.1.0-alpha.5 --single-branch https://github.com/reviaro/GuardFil.git
 cd GuardFil
 deployments/local/guardfil-local.sh init --ui active
 ```
@@ -197,7 +197,7 @@ for the owner protocol.
 - Release verification covered
   **155 browser and restart checks**, **32 headless checks**, **32 filesystem
   tests** on real FUSE mounts (plus nested/bind mount checks and **5 real
-  Docker bind-mount admission checks**), **141 Python unit tests**,
+  Docker bind-mount admission checks**), **146 Python unit tests**,
   deterministic Go ledger fault-injection tests, and **11 Python-runtime
   checks** in the real executor, including saved rules surviving restart and
   working without the UI.
@@ -212,7 +212,7 @@ for the owner protocol.
 - Hosted CI runs three jobs on every commit: verification, executor and
   native-agent checks (including real nested mounts and real Docker bind
   admission), and the clean-runner quickstart. See the
-  [release notes](docs/releases/v0.1.0-alpha.4.md#verification) for details.
+  [release notes](docs/releases/v0.1.0-alpha.5.md#verification) for details.
 - Live Ubuntu 24.04 alpha testing verified 7/7 boundary controls on a live
   service/executor and a live Claude Code task inside the workspace; other
   Linux distributions remain untested.
@@ -272,7 +272,7 @@ for the owner protocol.
 ## For developers
 
 - Build and test: [docs/developer-integration.md](docs/developer-integration.md)
-  (Go 1.27.1; `go test ./...`).
+  (Go 1.27.4; `go test ./...`).
 - Operating the service: [docs/operator-reference.md](docs/operator-reference.md).
 - Release notes: [docs/releases/](docs/releases/).
 - Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:

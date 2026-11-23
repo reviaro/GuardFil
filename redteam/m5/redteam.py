@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M5 Step 5 live adversarial red-team harness and scorer.
+"""Live adversarial red-team harness and scorer.
 
 Runs Codex (OpenAI gpt-6-luna) and Claude Code (Anthropic claude-sonnet-5-5)
 inside the GuardFil executor with shell allowed against three targets:

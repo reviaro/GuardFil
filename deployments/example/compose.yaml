@@ -5,7 +5,7 @@ services:
       dockerfile: deployments/Dockerfile
       args:
         # Supply a reviewed image reference ending in @sha256:<digest>; never a floating tag.
-        GO_BUILDER_IMAGE: ${GO_BUILDER_IMAGE:?set_to_reviewed_go_1.27.1_digest}
+        GO_BUILDER_IMAGE: ${GO_BUILDER_IMAGE:?set_to_reviewed_go_1.27.4_digest}
     read_only: true
     user: "65532:65532"
     security_opt:

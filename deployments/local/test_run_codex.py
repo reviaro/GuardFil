@@ -7,9 +7,24 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_codex as rc  # noqa: E402
+
+
+class OneShotTurnTests(unittest.TestCase):
+    def test_turn_status_reaches_one_shot_caller(self):
+        for status in ("completed", "failed", "interrupted"):
+            with self.subTest(status=status):
+                app = Mock(spec=rc.AppServer)
+                app.wait.side_effect = [{}, {"thread": {"id": "fixture"}}, {}, {"status": status}]
+                prompts = rc.interactive_prompts("Fix the fixture.", True)
+                if status == "completed":
+                    self.assertEqual(rc.run_turns(app, prompts, lambda _: None, once=True), 1)
+                else:
+                    with self.assertRaisesRegex(rc.RunError, status):
+                        rc.run_turns(app, prompts, lambda _: None, once=True)
 
 
 class FakeAsk:

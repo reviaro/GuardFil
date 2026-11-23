@@ -8,7 +8,7 @@ GuardFil is an alpha. It supports a local, single-user deployment on Linux.
 
 ## Build and test
 
-Prerequisites: Go `1.27.1` exactly (`GOTOOLCHAIN=local`), Python 3 for the
+Prerequisites: Go `1.27.4` exactly (`GOTOOLCHAIN=local`), Python 3 for the
 launcher, runners and Python tests, and Docker for the executor checks.
 
 ```sh
@@ -22,7 +22,7 @@ go test -race ./...
 ```
 
 Without a local Go toolchain, `devenv/ci-docker.sh` runs the same checks for
-a committed ref inside the pinned `golang:1.27.1-bookworm` image.
+a committed ref inside the pinned `golang:1.27.4-bookworm` image.
 
 Python unit tests (standard library only):
 
@@ -111,4 +111,4 @@ reach. See [concepts](guide/concepts.md).
 - Builds are checked for reproducibility on Linux `amd64` only. Releases are
   not signed and carry no provenance attestation.
 - See the README's [limits](../README.md#limits) and the
-  [release notes](releases/v0.1.0-alpha.4.md) for the rest.
+  [release notes](releases/v0.1.0-alpha.5.md) for the rest.

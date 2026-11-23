@@ -1,4 +1,4 @@
-# Tool catalog for agents in the executor (M5, run-agent): Claude Code's built-in
+# Tool catalog for agents in the executor (run-agent): Claude Code's built-in
 # tools, and the notes tools of the example Python agent (python_agent_example.py).
 # The managed hook (claude_hook.py) sends each built-in tool as claude.<name, lower-case>
 # with a projection of its input: the path, pattern, URL or query a rule can judge.

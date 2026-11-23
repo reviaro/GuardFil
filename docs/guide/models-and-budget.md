@@ -91,11 +91,13 @@ Each provider operates with its own independent, append-only budget ledger (`int
 Upgrading from an earlier alpha version that created legacy ledger folders (`t2a-experiment`, `gemini-experiment-6`, or `anthropic-experiment`)? Inspect and migrate them before starting an agent:
 
 ```sh
-guardfil-broker migrate-ledger --provider all --dry-run
-guardfil-broker migrate-ledger --provider all
+"${GF_HOME:-$HOME/.guardfil-local}/bin/guardfil-broker" migrate-ledger --provider all --dry-run
+"${GF_HOME:-$HOME/.guardfil-local}/bin/guardfil-broker" migrate-ledger --provider all
 ```
 
-The brokers refuse to start rather than silently opening a fresh ledger when an unmigrated legacy ledger is present.
+The brokers refuse to start while an unmigrated legacy ledger is present. For a healthy ledger, the migration validates settlement evidence against the journal before writing. A halted ledger keeps its halt reason, retained reservations, and evidence.
+
+If an alpha.5 initialization or empty-ledger migration stops partway through, repeat the original command. The broker uses the recorded intent to finish the same transaction. A target left by an older version without its matching retirement or recovery records remains ambiguous. Preserve both directories and recover from a known matching backup before requesting more provider work.
 
 ---
 

@@ -13,7 +13,7 @@ rules:
       principals: [codex-agent]
       operations: [tool.invoke]
       resources: [{kind: tool, value: stockapp.get_quote}]
-  # M4: news and support messages are allowed; content rules (content-rules.json)
+  # News and support messages are allowed; content rules (content-rules.json)
   # scan what they carry: injections in news, listed words in messages.
   - id: allow-news
     effect: allow

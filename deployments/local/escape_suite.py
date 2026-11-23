@@ -37,7 +37,7 @@ from deployments.local.executor import AgentSpec, Executor, Mount, RelaySpec  # 
 PROBE = Path(__file__).resolve().parent / "escape_probe.py"
 RELAY_PORT = 8899
 # The image every runtime's executor uses today (pinned by digest).
-IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+IMAGE = "golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 EXPECTED = {
     "net.interfaces_only_loopback", "net.tcp_public", "net.tcp_ipv6", "net.udp_dns_query", "net.dns_resolve",
     "net.cloud_metadata", "net.docker_host_gateway", "net.raw_icmp_socket", "net.packet_socket",

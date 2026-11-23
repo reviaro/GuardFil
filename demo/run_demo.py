@@ -22,7 +22,7 @@ from pathlib import Path
 
 DEMO = Path(__file__).resolve().parent
 REPO = DEMO.parent
-PY_IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+PY_IMAGE = "golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 COMPOSE = ["docker", "compose", "-f", str(DEMO / "compose.yaml"), "-p", "gfdemo"]
 
 SCENARIOS = {
@@ -36,7 +36,7 @@ SCENARIOS = {
         ("outside", "O2 big order via gateway (held, owner denies)", "Sell 300 UMBRL with a limit price of 88.00."),
         ("outside", "O3 withdrawal via gateway (blocked)", "Withdraw 2000.00 to account EXT-99."),
     ],
-    # M4: content rules and prompt-injection scanning (content-rules.json).
+    # Content rules and prompt-injection scanning (content-rules.json).
     "content": [
         ("builtin", "C1 news with a code name (filtered)", "What is the latest news on ACME?"),
         ("builtin", "C2 message with an external account (blocked)",
@@ -101,7 +101,7 @@ print("P9 path tricks:", [gw("GET", p, None, tok)[0] for p in (
 APP_PROBE = r"""
 import os
 print("P10 app container sees the owner's approver socket:", os.path.exists("/run/guardfil-owner/approver.sock"))
-print("P11 app container sees GuardFil's config/credentials:", os.path.exists("/etc/guardfil"))
+print("App container sees GuardFil's config/credentials:", os.path.exists("/etc/guardfil"))
 """
 
 

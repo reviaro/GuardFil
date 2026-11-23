@@ -39,7 +39,7 @@ func roundTrip(t *testing.T, handle func(net.Conn), req string) string {
 
 // An agent can reach the approval socket (and, with MCP, the filter socket),
 // but nothing it sends there answers a held call: answers come only through
-// the owner's approver socket or the UI (M5 escape suite, "answering its own
+// the owner's approver socket or the UI (escape suite, "answering its own
 // held call").
 func TestAgentCannotAnswerHeldCallOnItsSockets(t *testing.T) {
 	s, _ := askService(t, 30*time.Second)

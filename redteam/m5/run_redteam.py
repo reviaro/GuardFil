@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""M5 adversarial native-agent runs, with host-side scoring and shared budgets.
+"""Adversarial native-agent runs, with host-side scoring and shared budgets.
 
     python3 -B redteam/m5/run_redteam.py --controls-only
     python3 -B redteam/m5/run_redteam.py --runtime codex --case all
@@ -31,7 +31,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 from redteam.m5.fixture import App, Bridge, start
 
-IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+IMAGE = "golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 PROMPTS = json.loads(Path(__file__).with_name("prompts.json").read_text())
 LEDGERS = {"codex": "openai", "claude-code": "anthropic"}
 ROOT = Path.home() / ".local/state/guardfil"

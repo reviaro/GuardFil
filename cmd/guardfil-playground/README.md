@@ -20,19 +20,19 @@ You don't need Go installed. Run the pinned CI image from the repository root.
 Linux or macOS shell:
 
 ```sh
-docker run --rm -it -p 127.0.0.1:8787:8787 -v "$PWD:/src:ro" -w /src   -e GOTOOLCHAIN=local -e GOFLAGS="-mod=readonly -buildvcs=false"   golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195   go run ./cmd/guardfil-playground -addr 0.0.0.0:8787 -allow-non-loopback
+docker run --rm -it -p 127.0.0.1:8787:8787 -v "$PWD:/src:ro" -w /src   -e GOTOOLCHAIN=local -e GOFLAGS="-mod=readonly -buildvcs=false"   golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea   go run ./cmd/guardfil-playground -addr 0.0.0.0:8787 -allow-non-loopback
 ```
 
 Git Bash on Windows: `MSYS_NO_PATHCONV=1` stops MSYS from rewriting `/src` into a Windows path.
 
 ```sh
-MSYS_NO_PATHCONV=1 docker run --rm -it -p 127.0.0.1:8787:8787 -v "$(pwd -W):/src:ro" -w /src   -e GOTOOLCHAIN=local -e GOFLAGS="-mod=readonly -buildvcs=false"   golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195   go run ./cmd/guardfil-playground -addr 0.0.0.0:8787 -allow-non-loopback
+MSYS_NO_PATHCONV=1 docker run --rm -it -p 127.0.0.1:8787:8787 -v "$(pwd -W):/src:ro" -w /src   -e GOTOOLCHAIN=local -e GOFLAGS="-mod=readonly -buildvcs=false"   golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea   go run ./cmd/guardfil-playground -addr 0.0.0.0:8787 -allow-non-loopback
 ```
 
 PowerShell, as one line:
 
 ```powershell
-docker run --rm -it -p 127.0.0.1:8787:8787 -v "${PWD}:/src:ro" -w /src -e GOTOOLCHAIN=local -e GOFLAGS="-mod=readonly -buildvcs=false" golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 go run ./cmd/guardfil-playground -addr 0.0.0.0:8787 -allow-non-loopback
+docker run --rm -it -p 127.0.0.1:8787:8787 -v "${PWD}:/src:ro" -w /src -e GOTOOLCHAIN=local -e GOFLAGS="-mod=readonly -buildvcs=false" golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea go run ./cmd/guardfil-playground -addr 0.0.0.0:8787 -allow-non-loopback
 ```
 
 Then open <http://127.0.0.1:8787>. The first start downloads the image and one module, so it takes a minute. Stop it with Ctrl+C.

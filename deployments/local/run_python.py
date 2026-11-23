@@ -37,7 +37,7 @@ from deployments.local.agent_session import AgentSession, host_path, read_approv
 from deployments.local.executor import AgentSpec, Executor, Mount  # noqa: E402
 from deployments.local.runtime_cleanup import cleanup_after_error, finish_cli_cleanup, stop_session  # noqa: E402
 
-IMAGE = "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+IMAGE = "golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea"
 DEFAULT_AGENT = Path(__file__).resolve().parent / "python_agent_example.py"
 DEFAULT_MODEL = "gemini:gemini-3.5-flash-lite"
 
