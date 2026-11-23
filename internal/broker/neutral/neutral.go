@@ -387,6 +387,7 @@ func (s *NeutralBrokerServer) Handle(raw []byte) map[string]any {
 		tier = budget.ModelRates[canonicalModel].ServiceTier
 	}
 
+	billableInput := reply.BillingInputTokens()
 	receipt := &budget.Receipt{
 		Status:        budget.TerminalStatusCompleted,
 		ResponseID:    reply.ResponseID,
@@ -394,9 +395,9 @@ func (s *NeutralBrokerServer) Handle(raw []byte) map[string]any {
 		RequestDigest: digest,
 		Model:         canonicalModel,
 		ServiceTier:   tier,
-		InputTokens:   reply.Usage.InputTokens,
+		InputTokens:   billableInput,
 		OutputTokens:  reply.Usage.OutputTokens,
-		TotalTokens:   reply.Usage.InputTokens + reply.Usage.OutputTokens,
+		TotalTokens:   billableInput + reply.Usage.OutputTokens,
 	}
 
 	if _, err := ledger.Settle(permit, receipt); err != nil {

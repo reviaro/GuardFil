@@ -351,11 +351,13 @@ func (p *Proxy) toolResult(tool string, raw json.RawMessage) json.RawMessage {
 			items = append(items, map[string]any{"type": "text", "text": text})
 			continue
 		}
-		kind := it.Type
-		if kind == "" {
-			kind = "unreadable"
+		notice := "[unsupported content withheld by GuardFil]"
+		switch it.Type {
+		case "image", "audio", "resource", "resource_link", "text":
+			// Only these protocol-defined names may appear in a notice.
+			notice = "[" + it.Type + " withheld by GuardFil]"
 		}
-		items = append(items, map[string]any{"type": "text", "text": "[" + kind + " withheld by GuardFil]"})
+		items = append(items, map[string]any{"type": "text", "text": notice})
 	}
 	out["content"] = items
 	if len(in.StructuredContent) > 0 && string(in.StructuredContent) != "null" {

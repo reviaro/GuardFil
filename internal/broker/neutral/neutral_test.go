@@ -442,6 +442,47 @@ func TestProviderRefusalSettlesAtZeroAndKeepsLedger(t *testing.T) {
 	}
 }
 
+func TestAnthropicReceiptAccounting(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage string
+		valid       bool
+	}{
+		{"invalid output", `{"input_tokens":10,"output_tokens":false}`, false},
+		{"invalid cache total", `{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":"unknown"}`, false},
+		{"weighted cache", `{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":5,"cache_read_input_tokens":10,"service_tier":null}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, ledgers, ft, cleanup := setupTestServer(t, nil, nil)
+			defer cleanup()
+			ft.statuses = []int{200}
+			ft.replies = [][]byte{[]byte(`{"id":"msg_fixture","type":"message","model":"claude-sonnet-5-5","usage":` + tc.usage + `}`)}
+			request, _ := json.Marshal(sampleNeutralReq("anthropic:claude-sonnet-5-5"))
+			result := srv.Handle(request)
+			st, err := ledgers["anthropic"].GetStatus()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result["ok"] != tc.valid {
+				t.Fatalf("unexpected broker reply: %v", result)
+			}
+			if !tc.valid {
+				if !st.Halted || st.RetainedFailedMicros == 0 || st.SettledRequestsCount != 0 {
+					t.Fatalf("ambiguous usage was not retained: %+v", st)
+				}
+				return
+			}
+			cost, err := budget.ModelCostMicros("claude-sonnet-5-5", "standard", 21, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reply := result["reply"].(*adapters.NeutralReply)
+			if st.Halted || st.SettledRequestsCount != 1 || st.CommittedSpendMicros != cost || reply.Usage.InputTokens != 25 {
+				t.Fatalf("usage %+v, ledger %+v", reply.Usage, st)
+			}
+		})
+	}
+}
+
 func TestModelBindingAndPrefixRejection(t *testing.T) {
 	// 1. Explicit known Gemini alias preserves reply.Model as provider-reported metadata,
 	// while settlement receipt is bound to requested model.

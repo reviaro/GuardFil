@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/reviaro/guardfil/internal/approval"
 	"github.com/reviaro/guardfil/internal/config"
@@ -309,7 +310,7 @@ func setupWithContent(t *testing.T, crJSON string) (*httptest.Server, *seen, *lo
 		t.Fatal(err)
 	}
 	cat = bytes.Replace(cat, []byte(`limit_price: {type: decimal, min: "0.01", max: "1000000"}`),
-		[]byte("limit_price: {type: decimal, min: \"0.01\", max: \"1000000\"}\n      notes:       {type: string, max_length: 256}"), 1)
+		[]byte("limit_price: {type: decimal, min: \"0.01\", max: \"1000000\"}\n      notes:       {type: string, max_length: 256}\n      confirmed:   {type: boolean}"), 1)
 	pol, err := os.ReadFile("../../deployments/example/approval/stockapp-policy.yaml")
 	if err != nil {
 		t.Fatal(err)
@@ -449,6 +450,133 @@ func TestGatewayRequestBodyContentRules(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("content match not logged: %+v", last.Content)
+	}
+}
+
+func TestGatewayPreservesDecisionForRewrittenArguments(t *testing.T) {
+	for _, transport := range []string{"query", "body"} {
+		for _, action := range []string{"block", "ask"} {
+			t.Run(transport+"/"+action, func(t *testing.T) {
+				rules := `{"schema_version":1,"lists":[
+					{"id":"mask","name":"Mask","direction":"request","tools":["*"],"action":"filter","words":["sample"]},
+					{"id":"review","name":"Review","direction":"request","tools":["*"],"action":"` + action + `","patterns":["^sample$"]}]}`
+				gw, app, log := setupWithContent(t, rules)
+				svc := gw.Config.Handler.(*Gateway).svc.(*approval.Service)
+				if err := svc.EnableAsk(3 * time.Second); err != nil {
+					t.Fatal(err)
+				}
+				path := "/stockapp/api/orders"
+				body := `{"symbol":"ACME","side":"buy","quantity":1,"limit_price":10.50}`
+				if transport == "query" {
+					path += "?notes=sample"
+				} else {
+					body = strings.TrimSuffix(body, "}") + `,"notes":"sample"}`
+				}
+				done := make(chan int, 1)
+				go func() {
+					defer close(done)
+					code, _ := call(t, gw, "POST", path, body, nil)
+					done <- code
+				}()
+				if action == "ask" {
+					deadline := time.Now().Add(2 * time.Second)
+					var held []approval.PendingInfo
+					for time.Now().Before(deadline) {
+						held = svc.Pending()
+						if len(held) > 0 {
+							break
+						}
+						time.Sleep(time.Millisecond)
+					}
+					if len(held) != 1 || app.count() != 0 || len(held[0].RuleIDs) != 1 || held[0].RuleIDs[0] != "content:review" {
+						t.Fatalf("expected one pending review before dispatch, got %v", held)
+					}
+					if !strings.Contains(held[0].Detail, "[FILTERED:mask]") || strings.Contains(held[0].Detail, "sample") {
+						t.Fatalf("owner preview does not match sanitized operation: %s", held[0].Detail)
+					}
+					if err := svc.Answer(held[0].ID, true); err != nil {
+						t.Fatal(err)
+					}
+				}
+				code := <-done
+				if action == "block" {
+					if code != http.StatusForbidden || app.count() != 0 {
+						t.Fatalf("block: status %d, calls %d", code, app.count())
+					}
+				} else {
+					if code != http.StatusOK || app.count() != 1 {
+						t.Fatalf("approval: status %d, calls %d", code, app.count())
+					}
+					request, data := app.last()
+					if transport == "query" && request.URL.Query().Get("notes") != "[FILTERED:mask]" ||
+						transport == "body" && !bytes.Contains(data, []byte(`"notes":"[FILTERED:mask]"`)) {
+						t.Fatal("upstream did not receive the reviewed arguments")
+					}
+				}
+				var entry approval.LogEntry
+				lines := strings.Split(strings.TrimSpace(log.String()), "\n")
+				if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+					t.Fatal(err)
+				}
+				if len(entry.Content) != 2 || entry.Content[0].List != "mask" || entry.Content[1].List != "review" ||
+					entry.Content[1].Action != action || entry.Content[1].Count != 1 || strings.Contains(log.String(), "sample") {
+					t.Fatalf("incorrect content decision record: %+v", entry.Content)
+				}
+			})
+		}
+	}
+}
+
+func TestGatewayChecksBooleanArgumentsInEveryTransport(t *testing.T) {
+	const rules = `{"schema_version":1,"lists":[{"id":"flag","name":"Flag","direction":"request","tools":["*"],"action":"block","words":["true"]}]}`
+	const path = "/stockapp/api/orders"
+	const fields = `{"symbol":"ACME","side":"buy","quantity":1,"limit_price":10`
+	gw, app, _ := setupWithContent(t, rules)
+	g := gw.Config.Handler.(*Gateway)
+	up := g.upstreams["stockapp"]
+	up.routes = append(up.routes, route{method: "POST", segments: []string{"api", "orders", "{confirmed}"}, tool: "stockapp.place_order", server: "stockapp", name: "place_order"})
+	for _, tc := range []struct{ path, body string }{
+		{path + "?confirmed=true", fields + "}"},
+		{path, fields + `,"confirmed":true}`},
+		{path + "/true", fields + "}"},
+	} {
+		code, reply := call(t, gw, "POST", tc.path, tc.body, nil)
+		if code != http.StatusForbidden || !strings.Contains(reply, "content:flag") || app.count() != 0 {
+			t.Fatalf("status %d, reply %s, calls %d", code, reply, app.count())
+		}
+	}
+}
+func TestGatewayRejectsInvalidTextBeforeDispatch(t *testing.T) {
+	gw, app := setup(t)
+	const order = `{"symbol":"ACME","side":"buy","quantity":1,"limit_price":10}`
+	for _, tc := range []struct{ query, body string }{
+		{"?notes=%FF", order},
+		{"?%FF=value", order},
+		{"", strings.Replace(order, "ACME", string([]byte{0xff}), 1)},
+	} {
+		code, reply := call(t, gw, "POST", "/stockapp/api/orders"+tc.query, tc.body, nil)
+		if code != http.StatusForbidden || !strings.Contains(reply, "GATEWAY_BAD_REQUEST") || app.count() != 0 {
+			t.Fatalf("status %d, reply %s, calls %d", code, reply, app.count())
+		}
+	}
+}
+
+func TestGatewayRefusesChangedRewriteRules(t *testing.T) {
+	gw, app, _ := setupWithContent(t, `{"schema_version":1,"lists":[]}`)
+	g := gw.Config.Handler.(*Gateway)
+	svc := g.svc.(*approval.Service)
+	snapshot := svc.ContentRules()
+	replacement, err := content.ParseRules([]byte(`{"schema_version":1,"lists":[]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.ContentRules = func() *content.Rules {
+		svc.SetContentRules(replacement)
+		return snapshot
+	}
+	code, reply := call(t, gw, "GET", "/stockapp/api/quote/ACME", "", nil)
+	if code != http.StatusForbidden || !strings.Contains(reply, "POLICY_CHANGED") || app.count() != 0 {
+		t.Fatalf("status %d, reply %s, calls %d", code, reply, app.count())
 	}
 }
 

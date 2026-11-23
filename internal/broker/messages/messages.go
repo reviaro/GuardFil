@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
 	"os"
@@ -229,20 +228,8 @@ func toInt(v any) int {
 
 // BillableInput calculates the input tokens as the ledger counts them.
 func BillableInput(usage map[string]any) (int, error) {
-	n := func(k string) int {
-		return toInt(usage[k])
-	}
-	writes := CacheWriteFactor * n("cache_creation_input_tokens")
-	if split, ok := usage["cache_creation"].(map[string]any); ok {
-		m5 := toInt(split["ephemeral_5m_input_tokens"])
-		h1 := toInt(split["ephemeral_1h_input_tokens"])
-		if m5 >= 0 && h1 >= 0 && m5+h1 == n("cache_creation_input_tokens") {
-			writes = int(math.Ceil(float64(m5)*5.0/4.0)) + 2*h1
-		}
-	}
-	cacheRead := n("cache_read_input_tokens")
-	readTokens := int(math.Ceil(float64(cacheRead) / 10.0))
-	return n("input_tokens") + writes + readTokens, nil
+	_, billable, err := budget.AnthropicInputTokens(usage)
+	return billable, err
 }
 
 // Reservation calculates the worst case reservation amount for the built-in model.
@@ -521,11 +508,10 @@ func (s *MessagesBrokerServer) HandleFrame(raw []byte) (int, []byte) {
 		return status, cbody
 	}
 
-	var countReply map[string]any
-	if err := json.Unmarshal(cbody, &countReply); err != nil || countReply["input_tokens"] == nil {
+	countedInput, err := budget.AnthropicCountedInput(cbody)
+	if err != nil {
 		return makeErrorPayload(http.StatusBadGateway, "api_error", "count_tokens reply unusable; nothing was spent")
 	}
-	countedInput := toInt(countReply["input_tokens"])
 
 	amount := ReservationForModel(model, countedInput, toInt(out["max_tokens"]))
 	if amount > budget.ReservationAmountMicros {
@@ -581,10 +567,8 @@ func (s *MessagesBrokerServer) HandleFrame(raw []byte) (int, []byte) {
 		return status, rbody
 	}
 
-	d2 := json.NewDecoder(bytes.NewReader(rbody))
-	d2.UseNumber()
-	var msg map[string]any
-	if err := d2.Decode(&msg); err != nil || msg["type"] != "message" {
+	msg, err := budget.DecodeProviderMessage(rbody)
+	if err != nil || msg["type"] != "message" {
 		_, _ = s.ledger.RecordFailure(permit, "RECEIPT_SCHEMA_VIOLATION")
 		s.stopped = true
 		return makeErrorPayload(http.StatusBadGateway, "api_error", "Anthropic reply unusable")
@@ -606,21 +590,11 @@ func (s *MessagesBrokerServer) HandleFrame(raw []byte) (int, []byte) {
 	}
 
 	usage, _ := msg["usage"].(map[string]any)
-	if usage == nil || usage["output_tokens"] == nil {
-		_, _ = s.ledger.RecordFailure(permit, "RECEIPT_SCHEMA_VIOLATION")
-		s.stopped = true
-		return makeErrorPayload(http.StatusBadGateway, "api_error", "Anthropic reply unusable")
-	}
-	inTok, err := BillableInput(usage)
+	counts, err := budget.ParseAnthropicUsage(usage, budget.ModelRates[model].ServiceTier)
 	if err != nil {
 		_, _ = s.ledger.RecordFailure(permit, "RECEIPT_SCHEMA_VIOLATION")
 		s.stopped = true
-		return makeErrorPayload(http.StatusBadGateway, "api_error", "Anthropic reply unusable")
-	}
-	outTok := toInt(usage["output_tokens"])
-	tier, _ := usage["service_tier"].(string)
-	if tier == "" {
-		tier = budget.ModelRates[model].ServiceTier
+		return makeErrorPayload(http.StatusBadGateway, "api_error", "Anthropic reply has invalid usage")
 	}
 
 	receipt := &budget.Receipt{
@@ -629,10 +603,10 @@ func (s *MessagesBrokerServer) HandleFrame(raw []byte) (int, []byte) {
 		RequestID:     requestID,
 		RequestDigest: digest,
 		Model:         model,
-		ServiceTier:   tier,
-		InputTokens:   inTok,
-		OutputTokens:  outTok,
-		TotalTokens:   inTok + outTok,
+		ServiceTier:   counts.ServiceTier,
+		InputTokens:   counts.BillableInputTokens,
+		OutputTokens:  counts.OutputTokens,
+		TotalTokens:   counts.BillableInputTokens + counts.OutputTokens,
 	}
 
 	if _, err := s.ledger.Settle(permit, receipt); err != nil {

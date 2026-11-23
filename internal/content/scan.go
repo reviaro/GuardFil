@@ -1,7 +1,9 @@
 package content
 
 import (
+	"slices"
 	"sort"
+	"strings"
 )
 
 // Scan evaluates text against the content rules for the given tool and direction.
@@ -94,6 +96,56 @@ func (r *Rules) Scan(tool string, direction Direction, text string) Outcome {
 		Text:    rewritten,
 		Matches: matches,
 	}
+}
+
+// GatewayRequestOutcome checks the original policy decision and the values
+// that will actually be sent. A filter obligation is satisfied only when the
+// outgoing request no longer matches that list.
+func (r *Rules) GatewayRequestOutcome(tool string, original, outgoing []string) (Outcome, map[string]bool) {
+	before := r.gatewayMatchCounts(tool, original)
+	after := before
+	if !slices.Equal(original, outgoing) {
+		after = r.gatewayMatchCounts(tool, outgoing)
+	}
+	out := Outcome{Action: ActionNone}
+	var unfiltered map[string]bool
+	for _, list := range r.Lists {
+		n := max(before[list.ID], after[list.ID])
+		if n == 0 {
+			continue
+		}
+		out.Matches = append(out.Matches, Match{List: list.ID, Count: n, Action: string(list.Action)})
+		if list.Action == ActionFilter {
+			if after[list.ID] > 0 {
+				if unfiltered == nil {
+					unfiltered = make(map[string]bool)
+				}
+				unfiltered[list.ID] = true
+				out.Action = ActionBlock
+			}
+		} else {
+			out.Action = MaxAction(out.Action, list.Action)
+		}
+	}
+	return out, unfiltered
+}
+
+// Filters rewrite individual values. The approval service also supports
+// patterns spanning values in their canonical order. Keep both views without
+// counting the same list match twice.
+func (r *Rules) gatewayMatchCounts(tool string, values []string) map[string]int {
+	counts := make(map[string]int)
+	for _, value := range values {
+		for _, m := range r.Scan(tool, DirectionRequest, value).Matches {
+			counts[m.List] += m.Count
+		}
+	}
+	if len(values) != 1 {
+		for _, m := range r.Scan(tool, DirectionRequest, strings.Join(values, "\n")).Matches {
+			counts[m.List] = max(counts[m.List], m.Count)
+		}
+	}
+	return counts
 }
 
 // ScansResponses reports whether any response rule or the injection scan

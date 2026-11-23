@@ -76,11 +76,14 @@ func TestToolResultIsFilteredAndRebuilt(t *testing.T) {
 	if len(got) != 1 || strings.Contains(got[0], secret) {
 		t.Fatalf("got %v", got)
 	}
-	for _, want := range []string{"[REDACTED:secret_field]", "[image withheld by GuardFil]", "[markdown withheld by GuardFil]",
-		"[unreadable withheld by GuardFil]", `"isError":false`} {
-		if !strings.Contains(got[0], want) && !(want == "[unreadable withheld by GuardFil]" && strings.Contains(got[0], "[text withheld by GuardFil]")) {
+	for _, want := range []string{"[REDACTED:secret_field]", "[image withheld by GuardFil]", "[unsupported content withheld by GuardFil]",
+		"[text withheld by GuardFil]", `"isError":false`} {
+		if !strings.Contains(got[0], want) {
 			t.Errorf("missing %s in %s", want, got[0])
 		}
+	}
+	if strings.Contains(got[0], "markdown") {
+		t.Error("unsupported item label appeared in the generated notice")
 	}
 	if strings.Contains(got[0], "_meta") {
 		t.Errorf("_meta passed: %s", got[0])

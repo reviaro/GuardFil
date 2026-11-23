@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/reviaro/guardfil/internal/broker/budget"
 )
 
 const (
@@ -50,13 +52,23 @@ type NeutralUsage struct {
 }
 
 type NeutralReply struct {
-	Text        string       `json:"text"`
-	ToolCalls   []ToolCall   `json:"tool_calls"`
-	Stop        string       `json:"stop"`
-	Usage       NeutralUsage `json:"usage"`
-	Model       string       `json:"model"`
-	ResponseID  string       `json:"response_id"`
-	ServiceTier string       `json:"service_tier,omitempty"`
+	billableInput *int
+	Text          string       `json:"text"`
+	ToolCalls     []ToolCall   `json:"tool_calls"`
+	Stop          string       `json:"stop"`
+	Usage         NeutralUsage `json:"usage"`
+	Model         string       `json:"model"`
+	ResponseID    string       `json:"response_id"`
+	ServiceTier   string       `json:"service_tier,omitempty"`
+}
+
+// BillingInputTokens accounts for provider-specific cache pricing while the
+// neutral API reports actual token counts to its caller.
+func (r *NeutralReply) BillingInputTokens() int {
+	if r.billableInput != nil {
+		return *r.billableInput
+	}
+	return r.Usage.InputTokens
 }
 
 type Adapter interface {
@@ -568,10 +580,8 @@ func (a *AnthropicMessages) Parse(status int, raw []byte) (*NeutralReply, error)
 	if status != 200 {
 		return nil, NeutralError{Msg: fmt.Sprintf("provider HTTP %d", status)}
 	}
-	d := json.NewDecoder(bytes.NewReader(raw))
-	d.UseNumber()
-	var r map[string]any
-	if err := d.Decode(&r); err != nil {
+	r, err := budget.DecodeProviderMessage(raw)
+	if err != nil {
 		return nil, NeutralError{Msg: "invalid json"}
 	}
 
@@ -606,16 +616,11 @@ func (a *AnthropicMessages) Parse(status int, raw []byte) (*NeutralReply, error)
 		}
 	}
 
-	u, ok := r["usage"].(map[string]any)
-	if !ok || u == nil {
-		return nil, NeutralError{Msg: "reply has no token usage"}
+	u, _ := r["usage"].(map[string]any)
+	counts, err := budget.ParseAnthropicUsage(u, "standard")
+	if err != nil {
+		return nil, NeutralError{Msg: "reply has invalid token usage"}
 	}
-	if u["input_tokens"] == nil || u["output_tokens"] == nil {
-		return nil, NeutralError{Msg: "reply has no token usage"}
-	}
-	inTok := toInt(u["input_tokens"])
-	outTok := toInt(u["output_tokens"])
-	inTok += toInt(u["cache_creation_input_tokens"]) + toInt(u["cache_read_input_tokens"])
 
 	rid, _ := r["id"].(string)
 	mName, _ := r["model"].(string)
@@ -632,19 +637,15 @@ func (a *AnthropicMessages) Parse(status int, raw []byte) (*NeutralReply, error)
 		stop = "max_tokens"
 	}
 
-	tier := "standard"
-	if sTier, ok := u["service_tier"].(string); ok && sTier != "" {
-		tier = sTier
-	}
-
 	return &NeutralReply{
-		Text:        strings.Join(textParts, ""),
-		ToolCalls:   calls,
-		Stop:        stop,
-		Usage:       NeutralUsage{InputTokens: inTok, OutputTokens: outTok},
-		Model:       mName,
-		ResponseID:  rid,
-		ServiceTier: tier,
+		billableInput: &counts.BillableInputTokens,
+		Text:          strings.Join(textParts, ""),
+		ToolCalls:     calls,
+		Stop:          stop,
+		Usage:         NeutralUsage{InputTokens: counts.InputTokens, OutputTokens: counts.OutputTokens},
+		Model:         mName,
+		ResponseID:    rid,
+		ServiceTier:   counts.ServiceTier,
 	}, nil
 }
 

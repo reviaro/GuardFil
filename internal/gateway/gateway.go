@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,7 +43,7 @@ const (
 
 // Decider is the approval service as the gateway uses it.
 type Decider interface {
-	DecideHTTPContext(context.Context, []byte, string, ...string) approval.Output
+	DecideGatewayContext(context.Context, []byte, string, approval.GatewayContent, string) approval.Output
 	Catalog() *approval.Catalog
 }
 type contextFilter interface {
@@ -187,48 +188,22 @@ func refuse(w http.ResponseWriter, status int, v Verdict) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// filtered reports whether any filter list matched, so the text was rewritten.
-func filtered(out content.Outcome) bool {
-	for _, m := range out.Matches {
-		if m.Action == string(content.ActionFilter) {
-			return true
-		}
-	}
-	return false
-}
-
-func scanAndRewriteJSON(v any, scan func(string) (content.Outcome, string)) (content.Outcome, any) {
-	combined := content.Outcome{Action: content.ActionNone}
-	switch val := v.(type) {
+// rewriteStrings applies request filters to JSON string values and preserves
+// numbers, keys and all other JSON types.
+func rewriteStrings(value any, rewrite func(string) string) any {
+	switch v := value.(type) {
 	case string:
-		out, rewritten := scan(val)
-		combined = out
-		return combined, rewritten
+		return rewrite(v)
 	case map[string]any:
-		newMap := make(map[string]any, len(val))
-		for k, item := range val {
-			out, newItem := scanAndRewriteJSON(item, scan)
-			if content.Stronger(out.Action, combined.Action) {
-				combined.Action = out.Action
-			}
-			combined.Matches = append(combined.Matches, out.Matches...)
-			newMap[k] = newItem
+		for k, item := range v {
+			v[k] = rewriteStrings(item, rewrite)
 		}
-		return combined, newMap
 	case []any:
-		newSlice := make([]any, len(val))
-		for i, item := range val {
-			out, newItem := scanAndRewriteJSON(item, scan)
-			if content.Stronger(out.Action, combined.Action) {
-				combined.Action = out.Action
-			}
-			combined.Matches = append(combined.Matches, out.Matches...)
-			newSlice[i] = newItem
+		for i, item := range v {
+			v[i] = rewriteStrings(item, rewrite)
 		}
-		return combined, newSlice
-	default:
-		return combined, v
 	}
+	return value
 }
 
 // RegisterSession records a per-agent session token and maps it to principal.
@@ -321,7 +296,11 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			Effect: "BLOCK", Reasons: []string{"GATEWAY_NO_ROUTE"}})
 		return
 	}
-	args, body, query, err := g.arguments(r, rt, params)
+	var original approval.GatewayContent
+	if g.ContentRules != nil {
+		original.Rules = g.ContentRules()
+	}
+	args, body, query, err := g.arguments(r, rt, params, &original)
 	if err != nil {
 		refuse(w, http.StatusForbidden, Verdict{Error: "blocked by GuardFil: " + err.Error(),
 			Effect: "BLOCK", Reasons: []string{"GATEWAY_BAD_REQUEST"}})
@@ -331,7 +310,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	req := []byte(`{"server":` + jsonString(rt.server) + `,"tool":` + jsonString(rt.name) + `,"arguments":` + string(args) +
 		`,"can_filter":true}`)
 	target := upstreamURL(up, rt, params, query)
-	out := g.svc.DecideHTTPContext(ctx, req, target, principal)
+	out := g.svc.DecideGatewayContext(ctx, req, target, original, principal)
 	if out.Effect != "ALLOW" {
 		refuse(w, http.StatusForbidden, Verdict{Error: "blocked by GuardFil", Effect: out.Effect,
 			Reasons: out.Reasons, RuleIDs: out.RuleIDs})
@@ -398,7 +377,7 @@ var numberLiteral = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`)
 // arguments merges path arguments, query parameters and the JSON body object.
 // It returns the decided arguments, the body to forward (re-encoded from the
 // decided values) and the query to forward.
-func (g *Gateway) arguments(r *http.Request, rt route, params map[string]string) ([]byte, []byte, url.Values, error) {
+func (g *Gateway) arguments(r *http.Request, rt route, params map[string]string, original *approval.GatewayContent) ([]byte, []byte, url.Values, error) {
 	args := map[string]json.RawMessage{}
 	spec := map[string]approval.ArgSpec{}
 	for _, t := range g.svc.Catalog().Tools() {
@@ -416,13 +395,14 @@ func (g *Gateway) arguments(r *http.Request, rt route, params map[string]string)
 		}
 		return json.RawMessage(jsonString(v))
 	}
-	var cr *content.Rules
-	if g.ContentRules != nil {
-		cr = g.ContentRules()
+	originalArgs := make(map[string]json.RawMessage)
+	rewrite := func(v string) string {
+		return original.Rules.Scan(rt.tool, content.DirectionRequest, v).Text
 	}
 
 	for k, v := range params {
 		args[k] = scalar(k, v)
+		originalArgs[k] = args[k]
 	}
 	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -435,14 +415,14 @@ func (g *Gateway) arguments(r *http.Request, rt route, params map[string]string)
 		if _, dup := args[k]; dup {
 			return nil, nil, nil, fmt.Errorf("argument %q given twice", k)
 		}
+		if !utf8.ValidString(k) || !utf8.ValidString(vs[0]) {
+			return nil, nil, nil, errors.New("query parameter is not valid UTF-8")
+		}
+		originalArgs[k] = scalar(k, vs[0])
 		val := vs[0]
-		if cr != nil {
-			// Only filter matches are rewritten here.  Block, ask and monitor
-			// matches stay in the arguments, so Decide applies them and logs it.
-			if out := cr.Scan(rt.tool, content.DirectionRequest, val); filtered(out) {
-				val = out.Text
-				query[k][0] = val
-			}
+		if original.Rules != nil {
+			val = rewrite(val)
+			query[k][0] = val
 		}
 		args[k] = scalar(k, val)
 	}
@@ -455,37 +435,47 @@ func (g *Gateway) arguments(r *http.Request, rt route, params map[string]string)
 		if mt := strings.TrimSpace(strings.SplitN(r.Header.Get("Content-Type"), ";", 2)[0]); mt != "application/json" {
 			return nil, nil, nil, errors.New("the body must be application/json")
 		}
+		if !utf8.Valid(raw) {
+			return nil, nil, nil, errors.New("body is not valid UTF-8")
+		}
 		body, err := jsonObject(raw)
 		if err != nil {
 			return nil, nil, nil, err
-		}
-		if cr != nil {
-			for k, v := range body {
-				var parsed any
-				dec := json.NewDecoder(bytes.NewReader(v))
-				dec.UseNumber() // a rewritten body keeps its exact decimals
-				if err := dec.Decode(&parsed); err == nil {
-					out, rewritten := scanAndRewriteJSON(parsed, func(s string) (content.Outcome, string) {
-						res := cr.Scan(rt.tool, content.DirectionRequest, s)
-						return res, res.Text
-					})
-					if filtered(out) {
-						if b, err := json.Marshal(rewritten); err == nil {
-							body[k] = json.RawMessage(b)
-						}
-					}
-				}
-			}
 		}
 		for k, v := range body {
 			if _, dup := args[k]; dup {
 				return nil, nil, nil, fmt.Errorf("argument %q given twice", k)
 			}
-			args[k] = v
+			originalArgs[k] = v
+			if original.Rules != nil {
+				var parsed any
+				dec := json.NewDecoder(bytes.NewReader(v))
+				dec.UseNumber()
+				if err := dec.Decode(&parsed); err != nil {
+					return nil, nil, nil, err
+				}
+				changed := false
+				rewritten := rewriteStrings(parsed, func(value string) string {
+					next := rewrite(value)
+					changed = changed || next != value
+					return next
+				})
+				if changed {
+					body[k], err = json.Marshal(rewritten)
+					if err != nil {
+						return nil, nil, nil, err
+					}
+				}
+			}
+			args[k] = body[k]
 		}
 		if fwdBody, err = json.Marshal(body); err != nil {
 			return nil, nil, nil, errors.New("body cannot be re-encoded")
 		}
+	}
+	original.Arguments, err = json.Marshal(originalArgs)
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	out, err := json.Marshal(args)
 	if err != nil {
@@ -576,7 +566,13 @@ func (g *Gateway) forward(w http.ResponseWriter, ctx context.Context, up *upstre
 		refuse(w, http.StatusBadGateway, Verdict{Error: "the app's response was unreadable or too large"})
 		return
 	}
-	ct := resp.Header.Get("Content-Type")
+	ct, safeType := gatewayContentType(resp.Header.Get("Content-Type"), up.secret)
+	loc := resp.Header.Get("Location")
+	if !safeType || containsSecretForm(loc, up.secret) {
+		refuse(w, http.StatusForbidden, Verdict{Error: "blocked by GuardFil: credential in response",
+			Effect: "BLOCK", Reasons: []string{"CREDENTIAL_IN_RESPONSE"}})
+		return
+	}
 	if up.secret != "" {
 		data = bytes.ReplaceAll(data, []byte(up.secret), []byte(redacted))
 	}
@@ -614,7 +610,7 @@ func (g *Gateway) forward(w http.ResponseWriter, ctx context.Context, up *upstre
 	if ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
-	if loc := resp.Header.Get("Location"); loc != "" && !containsSecretForm(loc, up.secret) {
+	if loc != "" {
 		decoded := loc
 		if unesc, err := url.QueryUnescape(loc); err == nil {
 			decoded = unesc
@@ -646,6 +642,29 @@ func (g *Gateway) forward(w http.ResponseWriter, ctx context.Context, up *upstre
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(data)
+}
+
+// Inspect the same media type and parameters that a client would decode.
+// Re-encode them so unrecognized or ambiguous parameter encodings cannot be
+// interpreted differently downstream.
+func gatewayContentType(raw, secret string) (string, bool) {
+	if raw == "" || secret == "" {
+		return raw, true
+	}
+	if containsSecretForm(raw, secret) {
+		return "", false
+	}
+	mediaType, params, err := mime.ParseMediaType(raw)
+	if err != nil {
+		return "", false
+	}
+	for name, value := range params {
+		if containsSecretForm(name, secret) || containsSecretForm(value, secret) {
+			return "", false
+		}
+	}
+	canonical := mime.FormatMediaType(mediaType, params)
+	return canonical, canonical != "" && !containsSecretForm(canonical, secret)
 }
 
 // secretForms is the credential as it may appear in a response: as is, JSON

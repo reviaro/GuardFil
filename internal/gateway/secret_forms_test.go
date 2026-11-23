@@ -16,6 +16,18 @@ import (
 	"github.com/reviaro/guardfil/internal/config"
 )
 
+func TestGatewayContentTypePreservesSafeParameters(t *testing.T) {
+	for _, header := range []string{"text/plain; charset=utf-8", "multipart/mixed; boundary=example"} {
+		got, ok := gatewayContentType(header, "example-credential")
+		if !ok || got != header {
+			t.Errorf("media type %q became %q (ok=%v)", header, got, ok)
+		}
+	}
+	if _, ok := gatewayContentType("text/plain; label*0=example; label*1=-credential", "example-credential"); ok {
+		t.Fatal("media type with sensitive decoded parameter was accepted")
+	}
+}
+
 // Audit finding 3: the injected credential reached the agent when the app
 // reflected it JSON-escaped, or in a Location header containing '+'.
 func TestCredentialNeverReachesAgentInAnyForm(t *testing.T) {
@@ -24,6 +36,9 @@ func TestCredentialNeverReachesAgentInAnyForm(t *testing.T) {
 	escU := strings.ReplaceAll(cred, "/", `\u002f`)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/api/quote/MEDIA":
+			w.Header().Set("Content-Type", "application/json; profile="+url.QueryEscape(cred))
+			_, _ = w.Write([]byte(`{"ok":true}`))
 		case "/api/quote/SLASH":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"debug_auth":"` + escSlash + `"}`))
@@ -95,7 +110,7 @@ func TestCredentialNeverReachesAgentInAnyForm(t *testing.T) {
 
 	forms := []string{cred, escSlash, escU, url.QueryEscape(cred), url.PathEscape(cred), strings.ReplaceAll(cred, "+", " ")}
 	forms = append(forms, strings.ReplaceAll(strings.ReplaceAll(url.QueryEscape(cred), "%2F", "%2f"), "%2B", "%2b"))
-	for _, sym := range []string{"SLASH", "UNI", "URLENC", "REDIR", "REDIRENC", "NDJSON", "PREFIX", "LOWERPCT"} {
+	for _, sym := range []string{"SLASH", "UNI", "URLENC", "REDIR", "REDIRENC", "NDJSON", "PREFIX", "LOWERPCT", "MEDIA"} {
 		req, _ := http.NewRequest("GET", gw.URL+"/stockapp/api/quote/"+sym, nil)
 		req.Header.Set("Authorization", "Bearer "+agentToken)
 		resp, err := client.Do(req)
@@ -104,10 +119,19 @@ func TestCredentialNeverReachesAgentInAnyForm(t *testing.T) {
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		loc := resp.Header.Get("Location")
+		if sym == "MEDIA" && resp.StatusCode != http.StatusForbidden {
+			t.Errorf("sensitive metadata: got status %d", resp.StatusCode)
+		}
 		for _, f := range forms {
-			if bytes.Contains(body, []byte(f)) || strings.Contains(loc, f) {
-				t.Errorf("%s: credential form %q reached the agent: status=%d body=%s location=%q", sym, f, resp.StatusCode, body, loc)
+			if bytes.Contains(body, []byte(f)) {
+				t.Errorf("%s: credential appeared in response body", sym)
+			}
+			for name, values := range resp.Header {
+				for _, value := range values {
+					if strings.Contains(value, f) {
+						t.Errorf("%s: credential appeared in %s", sym, name)
+					}
+				}
 			}
 		}
 	}

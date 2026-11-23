@@ -355,6 +355,85 @@ func TestBadReplyHalts(t *testing.T) {
 	}
 }
 
+func TestMalformedAnthropicUsageRetainsReservation(t *testing.T) {
+	for name, usage := range map[string]string{
+		"invalid cache metadata":  `{"input_tokens":4,"output_tokens":2,"cache_creation_input_tokens":5,"cache_creation":"unknown"}`,
+		"conflicting cache total": `{"input_tokens":4,"output_tokens":2,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":3}}`,
+		"malformed tier":          `{"input_tokens":4,"output_tokens":2,"service_tier":false}`,
+		"missing base input":      `{"output_tokens":2}`,
+		"invalid output":          `{"input_tokens":4,"output_tokens":"2"}`,
+		"negative cache total":    `{"input_tokens":4,"output_tokens":2,"cache_read_input_tokens":-1}`,
+		"fractional input":        `{"input_tokens":4.5,"output_tokens":2}`,
+		"ambiguous counter":       `{"input_tokens":4,"input_tokens":0,"output_tokens":2}`,
+		"unbounded cache":         `{"input_tokens":4,"output_tokens":2,"cache_creation_input_tokens":9223372036854775808}`,
+		"orphaned cache split":    `{"input_tokens":4,"output_tokens":2,"cache_creation":{"ephemeral_1h_input_tokens":3}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			reply := []byte(`{"type":"message","id":"msg_fixture","model":"` + Model + `","usage":` + usage + `}`)
+			srv, ledger, _, cleanup := setupTestBroker(t, []int{200}, [][]byte{reply}, 0)
+			defer cleanup()
+			request, _ := json.Marshal(sampleCCReq())
+			status, _ := srv.HandleFrame(request)
+			st, err := ledger.GetStatus()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status != 502 || !srv.stopped || !st.Halted || st.RetainedFailedMicros == 0 || st.SettledRequestsCount != 0 || st.CommittedSpendMicros != 0 {
+				t.Fatalf("status %d, ledger %+v", status, st)
+			}
+		})
+	}
+}
+
+func TestNullableUsageMetadataKeepsOrdinaryPricing(t *testing.T) {
+	usage := map[string]any{"input_tokens": 12, "output_tokens": 2, "cache_creation": nil, "cache_creation_input_tokens": nil, "cache_read_input_tokens": nil, "service_tier": nil}
+	counts, err := budget.ParseAnthropicUsage(usage, "standard")
+	if err != nil || counts.InputTokens != 12 || counts.BillableInputTokens != 12 || counts.OutputTokens != 2 || counts.ServiceTier != "standard" {
+		t.Fatalf("valid nullable usage: %+v (%v)", counts, err)
+	}
+}
+
+func TestMalformedCountStopsBeforeReservation(t *testing.T) {
+	srv, ledger, _, cleanup := setupTestBroker(t, nil, nil, 0)
+	defer cleanup()
+	calls := 0
+	srv.transport = func(path string, _ map[string]string, _ []byte) (int, []byte, error) {
+		calls++
+		if !strings.HasSuffix(path, "/count_tokens") {
+			t.Fatal("unexpected generation call")
+		}
+		return 200, []byte(`{"input_tokens":"unknown"}`), nil
+	}
+	raw, _ := json.Marshal(sampleCCReq())
+	status, _ := srv.HandleFrame(raw)
+	st, err := ledger.GetStatus()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status != 502 || calls != 1 || st.TotalReservationsCount != 0 || st.Halted {
+		t.Fatalf("status %d, calls %d, ledger %+v", status, calls, st)
+	}
+}
+
+func TestReceiptDecoderPreservesEmptyToolArrays(t *testing.T) {
+	const reply = `{"type":"message","id":"msg_fixture","model":"claude-sonnet-5-5","content":[{"type":"tool_use","id":"tool_1","name":"list","input":{"items":[]}}],"usage":{"input_tokens":1,"output_tokens":1}}`
+	for _, stream := range []bool{false, true} {
+		srv, _, _, cleanup := setupTestBroker(t, []int{200}, [][]byte{[]byte(reply)}, 0)
+		defer cleanup()
+		req := sampleCCReq()
+		req["stream"] = stream
+		raw, _ := json.Marshal(req)
+		status, data := srv.HandleFrame(raw)
+		want := `"items":[]`
+		if stream {
+			want = `\"items\":[]`
+		}
+		if status != 200 || !strings.Contains(string(data), want) {
+			t.Fatalf("empty array lost in reply (stream %v): %s", stream, data)
+		}
+	}
+}
+
 func TestProviderCeiling(t *testing.T) {
 	srv, _, ft, cleanup := setupTestBroker(t, nil, nil, 1_999_000)
 	defer cleanup()

@@ -174,6 +174,18 @@ func TestOpenAIRequest(t *testing.T) {
 	}
 }
 
+func TestAnthropicToolReplyKeepsEmptyArray(t *testing.T) {
+	raw := strings.Replace(string(anthropicReply), `"symbol": "ACME"`, `"items":[]`, 1)
+	reply, err := (&AnthropicMessages{}).Parse(200, []byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args, err := EncodeArguments(reply.ToolCalls[0].Arguments)
+	if err != nil || !strings.Contains(args, `"items":[]`) {
+		t.Fatalf("tool arguments: %s (%v)", args, err)
+	}
+}
+
 func TestAnthropicRequest(t *testing.T) {
 	a := &AnthropicMessages{}
 	req := sampleReq()

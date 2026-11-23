@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -791,16 +792,20 @@ func (s *Service) SetPolicy(raw []byte) (string, error) {
 // per line, or the shell command joined with spaces.
 func requestText(raw []byte) string {
 	in, err := parseStdinRequest(raw)
-	if err != nil || len(in.Arguments) == 0 {
+	if err != nil {
 		return ""
 	}
+	return strings.Join(argumentValues(in.Arguments, in.Shell, false), "\n")
+}
+
+func argumentValues(arguments json.RawMessage, shell, gateway bool) []string {
 	var v any
-	dec := json.NewDecoder(bytes.NewReader(in.Arguments))
+	dec := json.NewDecoder(bytes.NewReader(arguments))
 	dec.UseNumber()
 	if dec.Decode(&v) != nil {
-		return string(in.Arguments)
+		return []string{string(arguments)}
 	}
-	if in.Shell {
+	if shell {
 		if m, ok := v.(map[string]any); ok {
 			if argv, ok := m["command"].([]any); ok {
 				parts := make([]string, 0, len(argv))
@@ -809,10 +814,11 @@ func requestText(raw []byte) string {
 						parts = append(parts, s)
 					}
 				}
-				return strings.Join(parts, " ")
+				return []string{strings.Join(parts, " ")}
 			}
 		}
 	}
+
 	var lines []string
 	var walk func(any)
 	walk = func(x any) {
@@ -821,6 +827,10 @@ func requestText(raw []byte) string {
 			lines = append(lines, t)
 		case json.Number:
 			lines = append(lines, t.String())
+		case bool:
+			if gateway {
+				lines = append(lines, strconv.FormatBool(t))
+			}
 		case map[string]any:
 			keys := make([]string, 0, len(t))
 			for k := range t {
@@ -837,7 +847,7 @@ func requestText(raw []byte) string {
 		}
 	}
 	walk(v)
-	return strings.Join(lines, "\n")
+	return lines
 }
 
 // Decide evaluates one request and appends its log entry.  If the log cannot be
@@ -847,7 +857,7 @@ func (s *Service) Decide(raw []byte, principal ...string) Output {
 }
 
 func (s *Service) DecideContext(ctx context.Context, raw []byte, principal ...string) Output {
-	return s.decideContext(ctx, raw, "", principal...)
+	return s.decideContext(ctx, raw, "", nil, principal...)
 }
 
 // DecideHTTPContext binds the gateway's actual transport URL to the same
@@ -857,10 +867,35 @@ func (s *Service) DecideHTTPContext(ctx context.Context, raw []byte, target stri
 	if target == "" {
 		return BlockedOutput("WEBSITE_URL_UNSUPPORTED", s.PolicyDigest(), "-", nil)
 	}
-	return s.decideContext(ctx, raw, target, principal...)
+	return s.decideContext(ctx, raw, target, nil, principal...)
 }
 
-func (s *Service) decideContext(ctx context.Context, raw []byte, target string, principal ...string) Output {
+// GatewayContent binds the original gateway arguments and the exact rules
+// used to rewrite them. Only the host gateway supplies this information.
+type GatewayContent struct {
+	Arguments json.RawMessage
+	Rules     *content.Rules
+}
+
+func (g GatewayContent) valid() bool {
+	// Unmarshalling during a rewrite can remove duplicate keys. Apply the
+	// normal request depth and uniqueness limits to the original arguments.
+	if len(g.Arguments) == 0 || len(g.Arguments) > MaxRequestBytes || g.Arguments[0] != '{' || !json.Valid(g.Arguments) {
+		return false
+	}
+	d := json.NewDecoder(bytes.NewReader(g.Arguments))
+	d.UseNumber()
+	return checkNoDuplicateKeys(d, 1) == nil
+}
+
+func (s *Service) DecideGatewayContext(ctx context.Context, raw []byte, target string, original GatewayContent, principal string) Output {
+	if target == "" {
+		return BlockedOutput("WEBSITE_URL_UNSUPPORTED", s.PolicyDigest(), "-", nil)
+	}
+	return s.decideContext(ctx, raw, target, &original, principal)
+}
+
+func (s *Service) decideContext(ctx context.Context, raw []byte, target string, original *GatewayContent, principal ...string) Output {
 	epoch := s.ruleEpoch()
 	princ := syntheticPrinc
 	if len(principal) > 0 && principal[0] != "" {
@@ -914,7 +949,11 @@ func (s *Service) decideContext(ctx context.Context, raw []byte, target string, 
 
 	var contentMatches []ContentMatch
 	if out.Effect == "ALLOW" {
-		if cr := s.ContentRules(); cr != nil {
+		if cr := s.ContentRules(); original != nil && !original.valid() {
+			out = BlockedOutput("GATEWAY_BAD_REQUEST", out.PolicyDigest, out.ActionDigest, out.RuleIDs)
+		} else if original != nil && cr != original.Rules {
+			out = BlockedOutput("POLICY_CHANGED", out.PolicyDigest, out.ActionDigest, out.RuleIDs)
+		} else if cr != nil {
 			in, err := parseStdinRequest(raw)
 			if cr.ScansResponses(tool) && (err != nil || !in.CanFilter) {
 				out = BlockedOutput("TRANSFORM_UNAVAILABLE", out.PolicyDigest, out.ActionDigest, out.RuleIDs)
@@ -924,13 +963,16 @@ func (s *Service) decideContext(ctx context.Context, raw []byte, target string, 
 				if in, err := parseStdinRequest(raw); err == nil && in.CanFilter && cr.ScansResponses(tool) && !hasString(out.Filter, "content") {
 					out.Filter = append(out.Filter, "content")
 				}
-				reqTxt := requestText(raw)
-				outcome := cr.Scan(tool, content.DirectionRequest, reqTxt)
-				// This path cannot rewrite requests. A filter match is therefore a
-				// block even when a separate ask rule is the scanner's strongest action.
-				for _, m := range outcome.Matches {
-					if m.Action == string(content.ActionFilter) {
-						outcome.Action = content.ActionBlock
+				var outcome content.Outcome
+				var unfiltered map[string]bool
+				if original != nil {
+					outcome, unfiltered = cr.GatewayRequestOutcome(tool, argumentValues(original.Arguments, false, true), argumentValues(in.Arguments, false, true))
+				} else {
+					outcome = cr.Scan(tool, content.DirectionRequest, requestText(raw))
+					for _, m := range outcome.Matches {
+						if m.Action == string(content.ActionFilter) {
+							outcome.Action = content.ActionBlock
+						}
 					}
 				}
 				for _, m := range outcome.Matches {
@@ -944,7 +986,7 @@ func (s *Service) decideContext(ctx context.Context, raw []byte, target string, 
 				case content.ActionBlock, content.ActionFilter:
 					var cRuleIDs []string
 					for _, m := range outcome.Matches {
-						if m.Action == string(content.ActionBlock) || m.Action == string(content.ActionFilter) {
+						if m.Action == string(content.ActionBlock) || (m.Action == string(content.ActionFilter) && (original == nil || unfiltered[m.List])) {
 							cRuleIDs = append(cRuleIDs, "content:"+m.List)
 						}
 					}

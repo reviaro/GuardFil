@@ -167,6 +167,17 @@ do the same, because it can introduce a protected name for data already read.
 Mappings are limited to 256 per view and 1,024 distinct views per service.
 Configure privacy against the intended workspace before accessing its data.
 
+When you use overlapping workspaces, add a local-only rule for the target's
+real path under `/workspace` in the registered containing workspace. Keep any
+rule you already have for its symlink. For example, if `/workspace/reports`
+links to `/workspace/team/private`, add `/workspace/team/private/**` to
+**Local-only files**. Register the containing workspace before the narrower
+session accesses any data. If the narrower workspace can run first, add a
+rule for its own view of the real path too. For example, with `team` as the
+workspace root, that rule is `/workspace/private/**`. A narrower workspace
+can see the target without seeing the symlink in its parent. Use one stable
+workspace root when you cannot establish these mappings.
+
 Keep the host source's mount topology stable during a run; restart affected
 runs after host mount changes. The host and owner socket remain trusted.
 Privacy enforcement requires the shipped session-bound launchers and brokers;

@@ -90,7 +90,7 @@ func decodeJSONValue(dec *json.Decoder) (any, error) {
 			}
 			return obj, nil
 		} else if t == '[' {
-			var arr []any
+			arr := make([]any, 0)
 			for dec.More() {
 				val, err := decodeJSONValue(dec)
 				if err != nil {
